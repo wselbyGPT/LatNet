@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import importlib.util
-import json
 import sys
 import types
 from pathlib import Path
@@ -10,6 +9,88 @@ import pytest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+
+
+
+def _install_cryptography_stub() -> None:
+    cryptography = types.ModuleType("cryptography")
+    hazmat = types.ModuleType("cryptography.hazmat")
+    primitives = types.ModuleType("cryptography.hazmat.primitives")
+    ciphers = types.ModuleType("cryptography.hazmat.primitives.ciphers")
+    aead = types.ModuleType("cryptography.hazmat.primitives.ciphers.aead")
+    asymmetric = types.ModuleType("cryptography.hazmat.primitives.asymmetric")
+    ed25519 = types.ModuleType("cryptography.hazmat.primitives.asymmetric.ed25519")
+    serialization = types.ModuleType("cryptography.hazmat.primitives.serialization")
+
+    class AESGCM:
+        def __init__(self, key: bytes):
+            self.key = key
+
+        def encrypt(self, nonce: bytes, pt: bytes, _aad):
+            return pt
+
+        def decrypt(self, nonce: bytes, ct: bytes, _aad):
+            return ct
+
+    class _Pub:
+        def __init__(self, data: bytes = b"p" * 32):
+            self.data = data
+
+        def public_bytes(self, _encoding, _format):
+            return self.data
+
+        def verify(self, _sig: bytes, _msg: bytes):
+            return None
+
+    class _Priv:
+        def __init__(self, data: bytes = b"s" * 32):
+            self.data = data
+
+        @classmethod
+        def generate(cls):
+            return cls()
+
+        @classmethod
+        def from_private_bytes(cls, data: bytes):
+            return cls(data)
+
+        def private_bytes(self, _encoding, _format, _encryption):
+            return self.data
+
+        def public_key(self):
+            return _Pub()
+
+        def sign(self, msg: bytes):
+            return b"sig:" + msg[:8]
+
+    class Ed25519PublicKey:
+        @classmethod
+        def from_public_bytes(cls, data: bytes):
+            return _Pub(data)
+
+    class Ed25519PrivateKey:
+        generate = _Priv.generate
+        from_private_bytes = _Priv.from_private_bytes
+
+    aead.AESGCM = AESGCM
+    ed25519.Ed25519PrivateKey = Ed25519PrivateKey
+    ed25519.Ed25519PublicKey = Ed25519PublicKey
+
+    serialization.Encoding = types.SimpleNamespace(Raw=object())
+    serialization.PublicFormat = types.SimpleNamespace(Raw=object())
+    serialization.PrivateFormat = types.SimpleNamespace(Raw=object())
+    serialization.NoEncryption = lambda: object()
+
+    sys.modules.setdefault("cryptography", cryptography)
+    sys.modules.setdefault("cryptography.hazmat", hazmat)
+    sys.modules.setdefault("cryptography.hazmat.primitives", primitives)
+    sys.modules.setdefault("cryptography.hazmat.primitives.ciphers", ciphers)
+    sys.modules.setdefault("cryptography.hazmat.primitives.ciphers.aead", aead)
+    sys.modules.setdefault("cryptography.hazmat.primitives.asymmetric", asymmetric)
+    sys.modules.setdefault("cryptography.hazmat.primitives.asymmetric.ed25519", ed25519)
+    sys.modules.setdefault("cryptography.hazmat.primitives.serialization", serialization)
 
 
 class _DummyKeyEncapsulation:
@@ -22,20 +103,11 @@ class _DummyKeyEncapsulation:
     def __exit__(self, *_args):
         return False
 
+    def generate_keypair(self):
+        return b"dummy-public"
 
-class _TestCryptoModule(types.ModuleType):
-    @staticmethod
-    def encrypt_layer(_key: bytes, obj: dict):
-        blob = json.dumps(obj, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        return {"nonce": "", "ct": blob.decode("utf-8")}
-
-    @staticmethod
-    def decrypt_layer(_key: bytes, wrapped: dict):
-        return json.loads(wrapped["ct"])
-
-    @staticmethod
-    def derive_hop_keys(_shared_secret: bytes, _circuit_id: str, _hop_name: str):
-        return (b"F" * 32, b"R" * 32)
+    def export_secret_key(self):
+        return b"dummy-secret"
 
 
 def _load_module(module_name: str, file_path: Path):
@@ -54,27 +126,32 @@ def latnet_modules():
     pkg.__path__ = [str(REPO_ROOT)]
     sys.modules[pkg_name] = pkg
 
+    _install_cryptography_stub()
+
     oqs_stub = types.ModuleType("oqs")
     oqs_stub.KeyEncapsulation = _DummyKeyEncapsulation
     sys.modules.setdefault("oqs", oqs_stub)
 
-    constants = _load_module("latnet.constants", REPO_ROOT / "wire.py")
-    util = _load_module("latnet.util", REPO_ROOT / "crypto.py")
-    wire = _load_module("latnet.wire", REPO_ROOT / "authority.py")
-
-    crypto_stub = _TestCryptoModule("latnet.crypto")
-    sys.modules["latnet.crypto"] = crypto_stub
-
-    directory_server = _load_module("latnet.client", REPO_ROOT / "client.py")
-    relay = _load_module("latnet.cli", REPO_ROOT / "cli.py")
+    constants = _load_module("latnet.constants", REPO_ROOT / "constants.py")
+    util = _load_module("latnet.util", REPO_ROOT / "util.py")
+    wire = _load_module("latnet.wire", REPO_ROOT / "wire.py")
+    crypto = _load_module("latnet.crypto", REPO_ROOT / "crypto.py")
+    authority = _load_module("latnet.authority", REPO_ROOT / "authority.py")
+    directory = _load_module("latnet.directory", REPO_ROOT / "directory.py")
+    client = _load_module("latnet.client", REPO_ROOT / "client.py")
+    relay = _load_module("latnet.relay", REPO_ROOT / "relay.py")
+    cli = _load_module("latnet.cli", REPO_ROOT / "cli.py")
 
     return {
         "constants": constants,
         "util": util,
         "wire": wire,
-        "crypto": crypto_stub,
-        "directory": directory_server,
+        "crypto": crypto,
+        "authority": authority,
+        "directory": directory,
+        "client": client,
         "relay": relay,
+        "cli": cli,
     }
 
 
