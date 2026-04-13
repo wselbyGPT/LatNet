@@ -166,3 +166,10 @@ def parse_get_bundle_request(obj: Any) -> None:
     src = _as_dict(obj, context="directory request")
     if src.get("type") != "GET_BUNDLE":
         raise ValueError("unknown message type")
+
+
+def parse_get_hidden_service_descriptor_request(obj: Any) -> str:
+    src = _as_dict(obj, context="directory request")
+    if src.get("type") != "GET_HS_DESCRIPTOR":
+        raise ValueError("unknown message type")
+    return _req_str(src, "service_name")
