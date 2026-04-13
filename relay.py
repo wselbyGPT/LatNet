@@ -1,178 +1,301 @@
 from __future__ import annotations
 
+import json
+import socket
+import threading
 import time
 from pathlib import Path
 from typing import Any
 
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
-from cryptography.hazmat.primitives.serialization import (
-    Encoding,
-    NoEncryption,
-    PrivateFormat,
-    PublicFormat,
-)
+import oqs
 
-from .constants import AUTH_SIGALG
-from .util import atomic_write_json, b64d, b64e, canonical_bytes, load_json, sha256_hex
+from .constants import DEFAULT_TIMEOUT, KEMALG
+from .crypto import decrypt_layer, derive_hop_keys, encrypt_layer
+from .util import atomic_write_json, b64d, b64e, load_json
+from .wire import recv_msg, send_msg
 
 
-def authority_key_id_from_public(public_key_b64: str) -> str:
-    return sha256_hex(b64d(public_key_b64))
+def init_relay_file(name: str, host: str, port: int, out_path: str | Path) -> dict[str, Any]:
+    with oqs.KeyEncapsulation(KEMALG) as kem:
+        public_key = kem.generate_keypair()
+        secret_key = kem.export_secret_key()
 
-
-def load_authority(path: str | Path) -> dict[str, Any]:
-    return load_json(path)
-
-
-def load_authority_public(path: str | Path) -> dict[str, Any]:
-    auth = load_authority(path)
-    if "public_key" not in auth:
-        raise ValueError("authority file missing public_key")
-    return {
-        "version": auth.get("version", 1),
-        "name": auth.get("name", "lab-authority"),
-        "sigalg": auth.get("sigalg", AUTH_SIGALG),
-        "public_key": auth["public_key"],
-        "key_id": auth.get("key_id") or authority_key_id_from_public(auth["public_key"]),
-    }
-
-
-def init_authority_file(name: str, out_path: str | Path) -> dict[str, Any]:
-    private_key = Ed25519PrivateKey.generate()
-    public_key = private_key.public_key()
-
-    authority = {
-        "version": 1,
+    relay_doc = {
         "name": name,
-        "sigalg": AUTH_SIGALG,
-        "public_key": b64e(public_key.public_bytes(Encoding.Raw, PublicFormat.Raw)),
-        "private_key": b64e(private_key.private_bytes(Encoding.Raw, PrivateFormat.Raw, NoEncryption())),
+        "host": host,
+        "port": port,
+        "kemalg": KEMALG,
+        "public_key": b64e(public_key),
+        "secret_key": b64e(secret_key),
     }
-    authority["key_id"] = authority_key_id_from_public(authority["public_key"])
-    atomic_write_json(out_path, authority)
-    return authority
+    atomic_write_json(out_path, relay_doc)
+    return relay_doc
 
 
-def export_authority_pub_file(authority_path: str | Path, out_path: str | Path) -> dict[str, Any]:
-    authority_pub = load_authority_public(authority_path)
-    atomic_write_json(out_path, authority_pub)
-    return authority_pub
+class RelayServer:
+    def __init__(self, relay_doc: dict[str, Any]):
+        self.relay_doc = relay_doc
+        self.circuits: dict[str, dict[str, Any]] = {}
+        self.lock = threading.Lock()
+
+    def circuit_snapshot(self, circuit_id: str) -> dict[str, Any] | None:
+        with self.lock:
+            state = self.circuits.get(circuit_id)
+            if state is None:
+                return None
+            return json.loads(json.dumps(state))
+
+    def set_circuit_state(self, circuit_id: str, state: dict[str, Any]) -> None:
+        with self.lock:
+            self.circuits[circuit_id] = state
+
+    def update_stream_state(self, circuit_id: str, stream_id: int, stream_state: dict[str, Any] | None) -> None:
+        with self.lock:
+            circuit = self.circuits[circuit_id]
+            streams = circuit.setdefault("streams", {})
+            sid = str(stream_id)
+            if stream_state is None:
+                streams.pop(sid, None)
+            else:
+                streams[sid] = stream_state
+
+    def relay_decap_and_keys(self, ct_b64: str, circuit_id: str) -> tuple[bytes, bytes]:
+        with oqs.KeyEncapsulation(self.relay_doc["kemalg"], b64d(self.relay_doc["secret_key"])) as kem:
+            shared_secret = kem.decap_secret(b64d(ct_b64))
+        return derive_hop_keys(shared_secret, circuit_id, self.relay_doc["name"])
+
+    def wrap_reverse_hop(self, reverse_key: bytes, next_response: dict[str, Any]) -> dict[str, Any]:
+        if not next_response.get("ok"):
+            return next_response
+        return {
+            "ok": True,
+            "reply_layer": encrypt_layer(
+                reverse_key,
+                {
+                    "cmd": "RELAY_BACK",
+                    "inner": next_response["reply_layer"],
+                },
+            ),
+        }
+
+    def handle_exit_cell(self, circuit_id: str, state: dict[str, Any], cell: dict[str, Any]) -> dict[str, Any]:
+        stream_id = cell["stream_id"]
+        seq = cell["seq"]
+        cell_type = cell["cell_type"]
+        payload = cell.get("payload", "")
+
+        streams = state.setdefault("streams", {})
+        sid = str(stream_id)
+        stream_state = streams.get(sid)
+
+        if cell_type == "BEGIN":
+            stream_state = {
+                "open": True,
+                "opened_at": time.time(),
+                "last_seq": seq,
+            }
+            self.update_stream_state(circuit_id, stream_id, stream_state)
+            reply_cell = {
+                "stream_id": stream_id,
+                "seq": seq,
+                "cell_type": "CONNECTED",
+                "payload": f"stream {stream_id} opened at exit {self.relay_doc['name']}",
+            }
+        elif cell_type == "DATA":
+            if not stream_state or not stream_state.get("open"):
+                reply_cell = {
+                    "stream_id": stream_id,
+                    "seq": seq,
+                    "cell_type": "ERROR",
+                    "payload": f"stream {stream_id} is not open",
+                }
+            else:
+                stream_state["last_seq"] = seq
+                self.update_stream_state(circuit_id, stream_id, stream_state)
+                reply_cell = {
+                    "stream_id": stream_id,
+                    "seq": seq,
+                    "cell_type": "DATA",
+                    "payload": f"echo[{stream_id}] {payload}",
+                }
+        elif cell_type == "END":
+            if not stream_state or not stream_state.get("open"):
+                reply_cell = {
+                    "stream_id": stream_id,
+                    "seq": seq,
+                    "cell_type": "ENDED",
+                    "payload": f"stream {stream_id} was already closed",
+                }
+            else:
+                self.update_stream_state(circuit_id, stream_id, None)
+                reply_cell = {
+                    "stream_id": stream_id,
+                    "seq": seq,
+                    "cell_type": "ENDED",
+                    "payload": f"stream {stream_id} closed at exit {self.relay_doc['name']}",
+                }
+        else:
+            reply_cell = {
+                "stream_id": stream_id,
+                "seq": seq,
+                "cell_type": "ERROR",
+                "payload": f"unknown cell_type {cell_type}",
+            }
+
+        print()
+        print(
+            f"[EXIT {self.relay_doc['name']}] circuit={circuit_id} "
+            f"stream={stream_id} seq={seq} type={cell_type} payload={payload!r}"
+        )
+        print(
+            f"[EXIT {self.relay_doc['name']}] reply "
+            f"stream={reply_cell['stream_id']} seq={reply_cell['seq']} "
+            f"type={reply_cell['cell_type']} payload={reply_cell['payload']!r}"
+        )
+        print()
+
+        return {
+            "ok": True,
+            "reply_layer": encrypt_layer(
+                b64d(state["reverse_key"]),
+                {
+                    "cmd": "REPLY_CELL",
+                    "cell": reply_cell,
+                },
+            ),
+        }
+
+    def forward_to_next(self, state: dict[str, Any], msg: dict[str, Any]) -> dict[str, Any]:
+        next_hop = state["next"]
+        with socket.create_connection((next_hop["host"], next_hop["port"]), timeout=DEFAULT_TIMEOUT) as sock:
+            send_msg(sock, msg)
+            return recv_msg(sock)
+
+    def handle_build(self, msg: dict[str, Any]) -> dict[str, Any]:
+        circuit_id = msg["circuit_id"]
+        forward_key, reverse_key = self.relay_decap_and_keys(msg["ct"], circuit_id)
+        layer = decrypt_layer(forward_key, msg["layer"])
+
+        if layer["cmd"] == "FORWARD_BUILD":
+            state = {
+                "role": "forward",
+                "forward_key": b64e(forward_key),
+                "reverse_key": b64e(reverse_key),
+                "next": layer["next"],
+                "streams": {},
+                "created_at": time.time(),
+            }
+            self.set_circuit_state(circuit_id, state)
+
+            next_build = {
+                "type": "BUILD",
+                "circuit_id": circuit_id,
+                "ct": layer["next_ct"],
+                "layer": layer["inner"],
+            }
+            return self.forward_to_next(state, next_build)
+
+        if layer["cmd"] == "EXIT_READY":
+            state = {
+                "role": "exit",
+                "forward_key": b64e(forward_key),
+                "reverse_key": b64e(reverse_key),
+                "streams": {},
+                "created_at": time.time(),
+            }
+            self.set_circuit_state(circuit_id, state)
+            print(f"[{self.relay_doc['name']}] circuit {circuit_id} ready as exit")
+            return {"ok": True, "status": "circuit_built", "role": "exit"}
+
+        return {"ok": False, "error": f"unknown build cmd: {layer['cmd']}"}
+
+    def handle_cell(self, msg: dict[str, Any]) -> dict[str, Any]:
+        circuit_id = msg["circuit_id"]
+        state = self.circuit_snapshot(circuit_id)
+        if state is None:
+            return {"ok": False, "error": f"unknown circuit_id {circuit_id}"}
+
+        forward_key = b64d(state["forward_key"])
+        reverse_key = b64d(state["reverse_key"])
+        layer = decrypt_layer(forward_key, msg["layer"])
+
+        if state["role"] == "forward":
+            if layer["cmd"] != "FORWARD_CELL":
+                return {"ok": False, "error": f"expected FORWARD_CELL, got {layer['cmd']}"}
+
+            next_msg = {
+                "type": "CELL",
+                "circuit_id": circuit_id,
+                "layer": layer["inner"],
+            }
+            next_response = self.forward_to_next(state, next_msg)
+            return self.wrap_reverse_hop(reverse_key, next_response)
+
+        if state["role"] == "exit":
+            if layer["cmd"] != "EXIT_CELL":
+                return {"ok": False, "error": f"expected EXIT_CELL, got {layer['cmd']}"}
+            return self.handle_exit_cell(circuit_id, state, layer["cell"])
+
+        return {"ok": False, "error": f"unknown circuit role {state['role']}"}
+
+    def handle_destroy(self, msg: dict[str, Any]) -> dict[str, Any]:
+        circuit_id = msg["circuit_id"]
+        state = self.circuit_snapshot(circuit_id)
+        if state is None:
+            return {"ok": True, "status": "already_gone"}
+
+        if state["role"] == "forward":
+            try:
+                self.forward_to_next(state, {"type": "DESTROY", "circuit_id": circuit_id})
+            except Exception:
+                pass
+
+        with self.lock:
+            self.circuits.pop(circuit_id, None)
+
+        print(f"[{self.relay_doc['name']}] circuit {circuit_id} destroyed")
+        return {"ok": True, "status": "destroyed"}
+
+    def handle_conn(self, conn: socket.socket) -> None:
+        try:
+            msg = recv_msg(conn)
+            msg_type = msg["type"]
+
+            if msg_type == "BUILD":
+                response = self.handle_build(msg)
+            elif msg_type == "CELL":
+                response = self.handle_cell(msg)
+            elif msg_type == "DESTROY":
+                response = self.handle_destroy(msg)
+            else:
+                response = {"ok": False, "error": f"unknown message type {msg_type}"}
+
+            send_msg(conn, response)
+        except Exception as exc:
+            try:
+                send_msg(conn, {"ok": False, "error": str(exc)})
+            except Exception:
+                pass
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
-def signable_descriptor_payload(relay_doc: dict[str, Any], valid_after: int, valid_until: int) -> dict[str, Any]:
-    relay_section = {
-        "name": relay_doc["name"],
-        "host": relay_doc["host"],
-        "port": relay_doc["port"],
-        "kemalg": relay_doc["kemalg"],
-        "public_key": relay_doc["public_key"],
-    }
-    descriptor_id = sha256_hex(canonical_bytes(relay_section))
-    return {
-        "version": 1,
-        "descriptor_id": descriptor_id,
-        "valid_after": valid_after,
-        "valid_until": valid_until,
-        "relay": relay_section,
-    }
-
-
-def sign_relay_file(
-    relay_path: str | Path,
-    authority_path: str | Path,
-    valid_for: int,
-    out_path: str | Path,
-) -> dict[str, Any]:
+def run_relay_server(relay_path: str) -> None:
     relay_doc = load_json(relay_path)
-    authority = load_authority(authority_path)
+    host = relay_doc["host"]
+    port = relay_doc["port"]
+    server = RelayServer(relay_doc)
 
-    if authority.get("sigalg") != AUTH_SIGALG:
-        raise ValueError(f"unsupported authority sigalg {authority.get('sigalg')}")
+    print(f"Starting relay {relay_doc['name']} on {host}:{port} using {relay_doc['kemalg']}")
 
-    valid_after = int(time.time())
-    valid_until = valid_after + valid_for
-    signed = signable_descriptor_payload(relay_doc, valid_after, valid_until)
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as srv:
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind((host, port))
+        srv.listen(128)
 
-    private_key = Ed25519PrivateKey.from_private_bytes(b64d(authority["private_key"]))
-    signature = private_key.sign(canonical_bytes(signed))
-
-    descriptor = {
-        "version": 1,
-        "sigalg": AUTH_SIGALG,
-        "authority_name": authority.get("name", "lab-authority"),
-        "authority_key_id": authority.get("key_id") or authority_key_id_from_public(authority["public_key"]),
-        "signed": signed,
-        "signature": b64e(signature),
-    }
-    atomic_write_json(out_path, descriptor)
-    return descriptor
-
-
-def descriptor_relay_view(descriptor: dict[str, Any]) -> dict[str, Any]:
-    return descriptor["signed"]["relay"]
-
-
-def verify_descriptor(descriptor: dict[str, Any], authority_pub: dict[str, Any], now: int | None = None) -> None:
-    now = now or int(time.time())
-
-    if descriptor.get("sigalg") != AUTH_SIGALG:
-        raise ValueError(f"unsupported descriptor sigalg {descriptor.get('sigalg')}")
-    if descriptor.get("authority_key_id") != authority_pub["key_id"]:
-        raise ValueError("descriptor authority key id does not match trusted authority")
-
-    signed = descriptor["signed"]
-    valid_after = signed["valid_after"]
-    valid_until = signed["valid_until"]
-
-    if now < valid_after:
-        raise ValueError(
-            f"descriptor for {signed['relay']['name']} is not valid yet: valid_after={valid_after}"
-        )
-    if now > valid_until:
-        raise ValueError(
-            f"descriptor for {signed['relay']['name']} expired: valid_until={valid_until}"
-        )
-
-    public_key = Ed25519PublicKey.from_public_bytes(b64d(authority_pub["public_key"]))
-    public_key.verify(b64d(descriptor["signature"]), canonical_bytes(signed))
-
-
-def verify_bundle(
-    bundle: dict[str, Any],
-    authority_pub: dict[str, Any],
-    now: int | None = None,
-) -> dict[str, dict[str, Any]]:
-    if bundle.get("version") != 1:
-        raise ValueError(f"unsupported bundle version {bundle.get('version')}")
-    if bundle.get("authority_key_id") != authority_pub["key_id"]:
-        raise ValueError("bundle authority key id does not match trusted authority")
-
-    verified: dict[str, dict[str, Any]] = {}
-    for descriptor in bundle.get("descriptors", []):
-        verify_descriptor(descriptor, authority_pub, now=now)
-        relay = descriptor_relay_view(descriptor)
-        verified[relay["name"]] = relay
-    return verified
-
-
-def make_bundle_file(
-    authority_pub_path: str | Path,
-    descriptor_paths: list[str],
-    out_path: str | Path,
-) -> dict[str, Any]:
-    authority_pub = load_authority_public(authority_pub_path)
-    descriptors: list[dict[str, Any]] = []
-
-    for path in descriptor_paths:
-        descriptor = load_json(path)
-        verify_descriptor(descriptor, authority_pub)
-        descriptors.append(descriptor)
-
-    bundle = {
-        "version": 1,
-        "generated_at": int(time.time()),
-        "authority_key_id": authority_pub["key_id"],
-        "descriptors": descriptors,
-    }
-    atomic_write_json(out_path, bundle)
-    return bundle
+        while True:
+            conn, _addr = srv.accept()
+            server.handle_conn(conn)

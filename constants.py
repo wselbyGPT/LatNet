@@ -1,0 +1,4 @@
+KEMALG = "ML-KEM-768"
+AUTH_SIGALG = "Ed25519"
+APP_SALT = b"mini-lattice-onion-v4"
+DEFAULT_TIMEOUT = 10.0

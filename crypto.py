@@ -1,48 +1,55 @@
 from __future__ import annotations
 
-import base64
 import hashlib
+import hmac
 import json
-import socket
-from pathlib import Path
+import os
 from typing import Any
 
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-def b64e(data: bytes) -> str:
-    return base64.b64encode(data).decode("ascii")
-
-
-def b64d(text: str) -> bytes:
-    return base64.b64decode(text.encode("ascii"))
+from .constants import APP_SALT
+from .util import b64d, b64e, canonical_bytes
 
 
-def sha256_hex(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
+def hkdf_extract(salt: bytes, ikm: bytes) -> bytes:
+    return hmac.new(salt, ikm, hashlib.sha256).digest()
 
 
-def canonical_bytes(obj: dict[str, Any]) -> bytes:
-    return json.dumps(obj, separators=(",", ":"), sort_keys=True).encode("utf-8")
+def hkdf_expand(prk: bytes, info: bytes, length: int) -> bytes:
+    out = b""
+    t = b""
+    counter = 1
+    while len(out) < length:
+        t = hmac.new(prk, t + info + bytes([counter]), hashlib.sha256).digest()
+        out += t
+        counter += 1
+    return out[:length]
 
 
-def recv_exact(sock: socket.socket, n: int) -> bytes:
-    chunks: list[bytes] = []
-    total = 0
-    while total < n:
-        chunk = sock.recv(n - total)
-        if not chunk:
-            raise ConnectionError("socket closed")
-        chunks.append(chunk)
-        total += len(chunk)
-    return b"".join(chunks)
+def derive_aead_key(shared_secret: bytes, circuit_id: str, hop_name: str, direction: str) -> bytes:
+    if direction not in {"forward", "reverse"}:
+        raise ValueError(f"invalid direction: {direction}")
+    prk = hkdf_extract(APP_SALT, shared_secret)
+    info = f"circuit={circuit_id}|hop={hop_name}|purpose=aead|dir={direction}".encode("utf-8")
+    return hkdf_expand(prk, info, 32)
 
 
-def atomic_write_json(path: str | Path, obj: dict[str, Any]) -> None:
-    target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    temp = target.with_suffix(target.suffix + ".tmp")
-    temp.write_text(json.dumps(obj, indent=2, sort_keys=True), encoding="utf-8")
-    temp.replace(target)
+def derive_hop_keys(shared_secret: bytes, circuit_id: str, hop_name: str) -> tuple[bytes, bytes]:
+    forward_key = derive_aead_key(shared_secret, circuit_id, hop_name, "forward")
+    reverse_key = derive_aead_key(shared_secret, circuit_id, hop_name, "reverse")
+    return forward_key, reverse_key
 
 
-def load_json(path: str | Path) -> dict[str, Any]:
-    return json.loads(Path(path).read_text(encoding="utf-8"))
+def encrypt_layer(key: bytes, obj: dict[str, Any]) -> dict[str, str]:
+    aes = AESGCM(key)
+    nonce = os.urandom(12)
+    pt = canonical_bytes(obj)
+    ct = aes.encrypt(nonce, pt, None)
+    return {"nonce": b64e(nonce), "ct": b64e(ct)}
+
+
+def decrypt_layer(key: bytes, wrapped: dict[str, str]) -> dict[str, Any]:
+    aes = AESGCM(key)
+    pt = aes.decrypt(b64d(wrapped["nonce"]), b64d(wrapped["ct"]), None)
+    return json.loads(pt.decode("utf-8"))
