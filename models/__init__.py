@@ -9,6 +9,13 @@ from .hidden_service import (
     parse_lettuce_name,
 )
 
+from .hidden_service_descriptor import (
+    HSDescriptorV2,
+    HSIntroductionPointV2,
+    parse_hidden_service_descriptor_v2,
+    verify_hidden_service_descriptor_v2,
+)
+
 from .protocol import (
     BuildEnvelope,
     CellEnvelope,
@@ -38,6 +45,10 @@ __all__ = [
     "is_valid_lettuce_name",
     "derive_lettuce_name_from_b64",
     "derive_lettuce_name",
+    "HSDescriptorV2",
+    "HSIntroductionPointV2",
+    "parse_hidden_service_descriptor_v2",
+    "verify_hidden_service_descriptor_v2",
     "BuildEnvelope",
     "CellEnvelope",
     "DestroyEnvelope",
