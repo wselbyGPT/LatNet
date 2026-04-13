@@ -1,7 +1,11 @@
 from .hidden_service import (
+    HiddenServiceDescriptor,
+    IntroductionPoint,
+    IntroductionPointAuth,
     derive_lettuce_name,
     derive_lettuce_name_from_b64,
     is_valid_lettuce_name,
+    parse_hidden_service_descriptor,
     parse_lettuce_name,
 )
 
@@ -26,6 +30,10 @@ from .protocol import (
 )
 
 __all__ = [
+    "HiddenServiceDescriptor",
+    "IntroductionPoint",
+    "IntroductionPointAuth",
+    "parse_hidden_service_descriptor",
     "parse_lettuce_name",
     "is_valid_lettuce_name",
     "derive_lettuce_name_from_b64",
