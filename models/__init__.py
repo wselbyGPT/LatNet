@@ -32,6 +32,7 @@ from .protocol import (
     parse_destroy_envelope,
     parse_exit_cell_layer,
     parse_get_bundle_request,
+    parse_get_hidden_service_descriptor_request,
     parse_layer,
     parse_stream_cell,
 )
@@ -64,6 +65,7 @@ __all__ = [
     "parse_destroy_envelope",
     "parse_exit_cell_layer",
     "parse_get_bundle_request",
+    "parse_get_hidden_service_descriptor_request",
     "parse_layer",
     "parse_stream_cell",
 ]
