@@ -97,6 +97,207 @@ def test_exit_begin_data_end_transitions(latnet_modules, relay_doc_fixture, mock
     assert data_after_end_cell["cell_type"] == "ERROR"
 
 
+def test_exit_rejects_replayed_data_and_end(latnet_modules, relay_doc_fixture, mock_key_material):
+    relay_mod = latnet_modules["relay"]
+    crypto_mod = latnet_modules["crypto"]
+
+    server = relay_mod.RelayServer(relay_doc_fixture)
+    circuit_id = "c-replay"
+    server.set_circuit_state(
+        circuit_id,
+        {
+            "role": "exit",
+            "forward_key": mock_key_material["forward_b64"],
+            "reverse_key": mock_key_material["reverse_b64"],
+            "streams": {},
+        },
+    )
+
+    assert _decrypt_reply(
+        crypto_mod,
+        mock_key_material["reverse"],
+        server.handle_cell(
+            _exit_cell_msg(
+                crypto_mod,
+                mock_key_material["forward"],
+                circuit_id,
+                {"stream_id": 7, "seq": 1, "cell_type": "BEGIN", "payload": "example:443"},
+            )
+        ),
+    )["cell_type"] == "CONNECTED"
+
+    assert _decrypt_reply(
+        crypto_mod,
+        mock_key_material["reverse"],
+        server.handle_cell(
+            _exit_cell_msg(
+                crypto_mod,
+                mock_key_material["forward"],
+                circuit_id,
+                {"stream_id": 7, "seq": 2, "cell_type": "DATA", "payload": "hello"},
+            )
+        ),
+    )["cell_type"] == "DATA"
+
+    replay_data = _decrypt_reply(
+        crypto_mod,
+        mock_key_material["reverse"],
+        server.handle_cell(
+            _exit_cell_msg(
+                crypto_mod,
+                mock_key_material["forward"],
+                circuit_id,
+                {"stream_id": 7, "seq": 2, "cell_type": "DATA", "payload": "replay"},
+            )
+        ),
+    )
+    assert replay_data["cell_type"] == "ERROR"
+    assert "duplicate seq" in replay_data["payload"]
+
+    assert _decrypt_reply(
+        crypto_mod,
+        mock_key_material["reverse"],
+        server.handle_cell(
+            _exit_cell_msg(
+                crypto_mod,
+                mock_key_material["forward"],
+                circuit_id,
+                {"stream_id": 7, "seq": 3, "cell_type": "END", "payload": "bye"},
+            )
+        ),
+    )["cell_type"] == "ENDED"
+
+    replay_end = _decrypt_reply(
+        crypto_mod,
+        mock_key_material["reverse"],
+        server.handle_cell(
+            _exit_cell_msg(
+                crypto_mod,
+                mock_key_material["forward"],
+                circuit_id,
+                {"stream_id": 7, "seq": 3, "cell_type": "END", "payload": "replay-end"},
+            )
+        ),
+    )
+    assert replay_end["cell_type"] == "ERROR"
+    assert "duplicate seq" in replay_end["payload"]
+
+
+def test_exit_rejects_skipped_sequence_values(latnet_modules, relay_doc_fixture, mock_key_material):
+    relay_mod = latnet_modules["relay"]
+    crypto_mod = latnet_modules["crypto"]
+
+    server = relay_mod.RelayServer(relay_doc_fixture)
+    circuit_id = "c-skipped"
+    server.set_circuit_state(
+        circuit_id,
+        {
+            "role": "exit",
+            "forward_key": mock_key_material["forward_b64"],
+            "reverse_key": mock_key_material["reverse_b64"],
+            "streams": {},
+        },
+    )
+
+    _decrypt_reply(
+        crypto_mod,
+        mock_key_material["reverse"],
+        server.handle_cell(
+            _exit_cell_msg(
+                crypto_mod,
+                mock_key_material["forward"],
+                circuit_id,
+                {"stream_id": 9, "seq": 1, "cell_type": "BEGIN", "payload": "example:443"},
+            )
+        ),
+    )
+    skipped = _decrypt_reply(
+        crypto_mod,
+        mock_key_material["reverse"],
+        server.handle_cell(
+            _exit_cell_msg(
+                crypto_mod,
+                mock_key_material["forward"],
+                circuit_id,
+                {"stream_id": 9, "seq": 3, "cell_type": "DATA", "payload": "jump"},
+            )
+        ),
+    )
+    assert skipped["cell_type"] == "ERROR"
+    assert "skipped seq 3" in skipped["payload"]
+
+
+def test_exit_sequence_tracking_is_per_stream_id(latnet_modules, relay_doc_fixture, mock_key_material):
+    relay_mod = latnet_modules["relay"]
+    crypto_mod = latnet_modules["crypto"]
+
+    server = relay_mod.RelayServer(relay_doc_fixture)
+    circuit_id = "c-mixed-streams"
+    server.set_circuit_state(
+        circuit_id,
+        {
+            "role": "exit",
+            "forward_key": mock_key_material["forward_b64"],
+            "reverse_key": mock_key_material["reverse_b64"],
+            "streams": {},
+        },
+    )
+
+    begin_stream_1 = _decrypt_reply(
+        crypto_mod,
+        mock_key_material["reverse"],
+        server.handle_cell(
+            _exit_cell_msg(
+                crypto_mod,
+                mock_key_material["forward"],
+                circuit_id,
+                {"stream_id": 1, "seq": 1, "cell_type": "BEGIN", "payload": "a:1"},
+            )
+        ),
+    )
+    begin_stream_2 = _decrypt_reply(
+        crypto_mod,
+        mock_key_material["reverse"],
+        server.handle_cell(
+            _exit_cell_msg(
+                crypto_mod,
+                mock_key_material["forward"],
+                circuit_id,
+                {"stream_id": 2, "seq": 1, "cell_type": "BEGIN", "payload": "b:2"},
+            )
+        ),
+    )
+    assert begin_stream_1["cell_type"] == "CONNECTED"
+    assert begin_stream_2["cell_type"] == "CONNECTED"
+
+    data_stream_1 = _decrypt_reply(
+        crypto_mod,
+        mock_key_material["reverse"],
+        server.handle_cell(
+            _exit_cell_msg(
+                crypto_mod,
+                mock_key_material["forward"],
+                circuit_id,
+                {"stream_id": 1, "seq": 2, "cell_type": "DATA", "payload": "s1"},
+            )
+        ),
+    )
+    data_stream_2 = _decrypt_reply(
+        crypto_mod,
+        mock_key_material["reverse"],
+        server.handle_cell(
+            _exit_cell_msg(
+                crypto_mod,
+                mock_key_material["forward"],
+                circuit_id,
+                {"stream_id": 2, "seq": 2, "cell_type": "DATA", "payload": "s2"},
+            )
+        ),
+    )
+    assert data_stream_1["cell_type"] == "DATA"
+    assert data_stream_2["cell_type"] == "DATA"
+
+
 def test_destroy_idempotency(latnet_modules, relay_doc_fixture, mock_key_material):
     relay_mod = latnet_modules["relay"]
 
