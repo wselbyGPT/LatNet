@@ -126,6 +126,11 @@ def latnet_modules():
     pkg.__path__ = [str(REPO_ROOT)]
     sys.modules[pkg_name] = pkg
 
+    models_pkg_name = f"{pkg_name}.models"
+    models_pkg = types.ModuleType(models_pkg_name)
+    models_pkg.__path__ = [str(REPO_ROOT / "models")]
+    sys.modules[models_pkg_name] = models_pkg
+
     _install_cryptography_stub()
 
     oqs_stub = types.ModuleType("oqs")
@@ -134,6 +139,7 @@ def latnet_modules():
 
     constants = _load_module("latnet.constants", REPO_ROOT / "constants.py")
     util = _load_module("latnet.util", REPO_ROOT / "util.py")
+    sys.modules.setdefault("util", util)
     wire = _load_module("latnet.wire", REPO_ROOT / "wire.py")
     crypto = _load_module("latnet.crypto", REPO_ROOT / "crypto.py")
     authority = _load_module("latnet.authority", REPO_ROOT / "authority.py")
@@ -141,6 +147,8 @@ def latnet_modules():
     client = _load_module("latnet.client", REPO_ROOT / "client.py")
     relay = _load_module("latnet.relay", REPO_ROOT / "relay.py")
     cli = _load_module("latnet.cli", REPO_ROOT / "cli.py")
+    hidden_service = _load_module("latnet.models.hidden_service", REPO_ROOT / "models" / "hidden_service.py")
+    models = _load_module("latnet.models", REPO_ROOT / "models" / "__init__.py")
 
     return {
         "constants": constants,
@@ -152,6 +160,8 @@ def latnet_modules():
         "client": client,
         "relay": relay,
         "cli": cli,
+        "models": models,
+        "models.hidden_service": hidden_service,
     }
 
 
