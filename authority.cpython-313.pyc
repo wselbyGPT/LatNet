@@ -1,0 +1,261 @@
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+
+from .authority import (
+    export_authority_pub_file,
+    init_authority_file,
+    make_bundle_file,
+    sign_relay_file,
+)
+from .client import (
+    client_build_circuit,
+    client_destroy_circuit,
+    client_send_cell,
+    load_client_state,
+    save_client_state,
+)
+from .directory import fetch_bundle_to_file, run_directory_server
+from .relay import init_relay_file, run_relay_server
+
+
+def cmd_init_authority(args: argparse.Namespace) -> None:
+    authority = init_authority_file(args.name, args.out)
+    print(f"Wrote authority file: {args.out}")
+    print(f"authority key id: {authority['key_id']}")
+
+
+def cmd_export_authority_pub(args: argparse.Namespace) -> None:
+    authority_pub = export_authority_pub_file(args.authority, args.out)
+    print(f"Wrote authority public file: {args.out}")
+    print(f"authority key id: {authority_pub['key_id']}")
+
+
+def cmd_init_relay(args: argparse.Namespace) -> None:
+    relay = init_relay_file(args.name, args.host, args.port, args.out)
+    print(f"Wrote relay file: {args.out}")
+    print(f"relay: {relay['name']} @ {relay['host']}:{relay['port']}")
+
+
+def cmd_sign_relay(args: argparse.Namespace) -> None:
+    descriptor = sign_relay_file(args.relay, args.authority, args.valid_for, args.out)
+    relay = descriptor["signed"]["relay"]
+    print(f"Signed descriptor for relay {relay['name']} -> {args.out}")
+    print(f"valid_after={descriptor['signed']['valid_after']}")
+    print(f"valid_until={descriptor['signed']['valid_until']}")
+
+
+def cmd_make_bundle(args: argparse.Namespace) -> None:
+    bundle = make_bundle_file(args.authority_pub, args.descriptors, args.out)
+    print(f"Wrote bundle: {args.out}")
+    print(f"included descriptors: {len(bundle['descriptors'])}")
+
+
+def cmd_run_directory(args: argparse.Namespace) -> None:
+    run_directory_server(args.bundle, args.host, args.port)
+
+
+def cmd_fetch_bundle(args: argparse.Namespace) -> None:
+    fetch_bundle_to_file(args.host, args.port, args.out)
+    print(f"Saved bundle to {args.out}")
+
+
+def cmd_run_relay(args: argparse.Namespace) -> None:
+    run_relay_server(args.relay)
+
+
+def cmd_build_circuit(args: argparse.Namespace) -> None:
+    state, response = client_build_circuit(
+        authority_pub_path=args.authority_pub,
+        route_names=args.route_names,
+        bundle_path=args.bundle,
+        directory_host=args.directory_host,
+        directory_port=args.directory_port,
+    )
+
+    print("Building circuit from verified descriptors:")
+    for relay in state["route"]:
+        print(f"  - {relay['name']} @ {relay['host']}:{relay['port']}")
+    print(f"circuit_id={state['circuit_id']}")
+    print("Build response:")
+    print(json.dumps(response, indent=2))
+
+    if not response.get("ok"):
+        raise SystemExit(1)
+
+    save_client_state(args.state, state)
+    print(f"Saved client state: {args.state}")
+
+
+def cmd_send_cell(args: argparse.Namespace) -> None:
+    state = load_client_state(args.state)
+
+    print(f"Sending cell on circuit {state['circuit_id']}")
+    print(
+        json.dumps(
+            {
+                "stream_id": args.stream_id,
+                "cell_type": args.cell_type,
+                "payload": args.payload or "",
+            },
+            indent=2,
+        )
+    )
+
+    state, relay_response, reply_cell = client_send_cell(
+        state=state,
+        stream_id=args.stream_id,
+        cell_type=args.cell_type,
+        payload=args.payload or "",
+    )
+
+    print("Relay response:")
+    print(json.dumps(relay_response, indent=2))
+
+    if not relay_response.get("ok"):
+        raise SystemExit(1)
+
+    print()
+    print("Client decrypted reply cell:")
+    print(json.dumps(reply_cell, indent=2))
+
+    save_client_state(args.state, state)
+
+
+def cmd_destroy_circuit(args: argparse.Namespace) -> None:
+    state = load_client_state(args.state)
+    response = client_destroy_circuit(state)
+    print(json.dumps(response, indent=2))
+
+    state_path = Path(args.state)
+    if state_path.exists():
+        state_path.unlink()
+        print(f"Removed client state: {args.state}")
+
+
+def cmd_demo_multi(args: argparse.Namespace) -> None:
+    build_args = argparse.Namespace(
+        authority_pub=args.authority_pub,
+        bundle=args.bundle,
+        directory_host=args.directory_host,
+        directory_port=args.directory_port,
+        route_names=args.route_names,
+        state=args.state,
+    )
+    cmd_build_circuit(build_args)
+
+    actions = [
+        (1, "BEGIN", "alpha stream start"),
+        (1, "DATA", "alpha says hello"),
+        (2, "BEGIN", "beta stream start"),
+        (2, "DATA", "beta says hello"),
+        (1, "DATA", "alpha second payload"),
+        (2, "END", ""),
+        (1, "END", ""),
+    ]
+
+    for stream_id, cell_type, payload in actions:
+        send_args = argparse.Namespace(
+            state=args.state,
+            stream_id=stream_id,
+            cell_type=cell_type,
+            payload=payload,
+        )
+        cmd_send_cell(send_args)
+
+    destroy_args = argparse.Namespace(state=args.state)
+    cmd_destroy_circuit(destroy_args)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Tiny lattice onion-routing lab refactored into modules"
+    )
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_init_auth = sub.add_parser("init-authority", help="Generate a directory authority signing key")
+    p_init_auth.add_argument("--name", default="lab-authority")
+    p_init_auth.add_argument("--out", required=True)
+    p_init_auth.set_defaults(func=cmd_init_authority)
+
+    p_export_auth = sub.add_parser("export-authority-pub", help="Export the public authority trust anchor")
+    p_export_auth.add_argument("--authority", required=True)
+    p_export_auth.add_argument("--out", required=True)
+    p_export_auth.set_defaults(func=cmd_export_authority_pub)
+
+    p_init = sub.add_parser("init-relay", help="Generate a relay ML-KEM keypair and save config")
+    p_init.add_argument("--name", required=True)
+    p_init.add_argument("--host", default="127.0.0.1")
+    p_init.add_argument("--port", required=True, type=int)
+    p_init.add_argument("--out", required=True)
+    p_init.set_defaults(func=cmd_init_relay)
+
+    p_sign = sub.add_parser("sign-relay", help="Sign a relay descriptor with the authority key")
+    p_sign.add_argument("--relay", required=True)
+    p_sign.add_argument("--authority", required=True)
+    p_sign.add_argument("--valid-for", type=int, default=86400)
+    p_sign.add_argument("--out", required=True)
+    p_sign.set_defaults(func=cmd_sign_relay)
+
+    p_bundle = sub.add_parser("make-bundle", help="Create a verified descriptor bundle for the directory")
+    p_bundle.add_argument("--authority-pub", required=True)
+    p_bundle.add_argument("--descriptors", nargs="+", required=True)
+    p_bundle.add_argument("--out", required=True)
+    p_bundle.set_defaults(func=cmd_make_bundle)
+
+    p_run_dir = sub.add_parser("run-directory", help="Serve the signed descriptor bundle over TCP")
+    p_run_dir.add_argument("--bundle", required=True)
+    p_run_dir.add_argument("--host", default="127.0.0.1")
+    p_run_dir.add_argument("--port", type=int, default=9200)
+    p_run_dir.set_defaults(func=cmd_run_directory)
+
+    p_fetch = sub.add_parser("fetch-bundle", help="Fetch the directory bundle from the directory server")
+    p_fetch.add_argument("--host", default="127.0.0.1")
+    p_fetch.add_argument("--port", type=int, default=9200)
+    p_fetch.add_argument("--out", required=True)
+    p_fetch.set_defaults(func=cmd_fetch_bundle)
+
+    p_run = sub.add_parser("run-relay", help="Run a relay")
+    p_run.add_argument("--relay", required=True)
+    p_run.set_defaults(func=cmd_run_relay)
+
+    p_build = sub.add_parser("build-circuit", help="Build a circuit from verified descriptors")
+    p_build.add_argument("--authority-pub", required=True)
+    source_group = p_build.add_mutually_exclusive_group(required=True)
+    source_group.add_argument("--bundle")
+    source_group.add_argument("--directory-host")
+    p_build.add_argument("--directory-port", type=int, default=9200)
+    p_build.add_argument("--route-names", nargs="+", required=True)
+    p_build.add_argument("--state", required=True)
+    p_build.set_defaults(func=cmd_build_circuit)
+
+    p_send = sub.add_parser("send-cell", help="Send one multiplexed cell over an existing circuit")
+    p_send.add_argument("--state", required=True)
+    p_send.add_argument("--stream-id", required=True, type=int)
+    p_send.add_argument("--cell-type", required=True, choices=["BEGIN", "DATA", "END"])
+    p_send.add_argument("--payload", default="")
+    p_send.set_defaults(func=cmd_send_cell)
+
+    p_destroy = sub.add_parser("destroy-circuit", help="Destroy a circuit and remove client state")
+    p_destroy.add_argument("--state", required=True)
+    p_destroy.set_defaults(func=cmd_destroy_circuit)
+
+    p_demo = sub.add_parser("demo-multi", help="Run a multi-stream demo using verified descriptors")
+    p_demo.add_argument("--authority-pub", required=True)
+    demo_source_group = p_demo.add_mutually_exclusive_group(required=True)
+    demo_source_group.add_argument("--bundle")
+    demo_source_group.add_argument("--directory-host")
+    p_demo.add_argument("--directory-port", type=int, default=9200)
+    p_demo.add_argument("--route-names", nargs="+", required=True)
+    p_demo.add_argument("--state", required=True)
+    p_demo.set_defaults(func=cmd_demo_multi)
+
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+    args.func(args)

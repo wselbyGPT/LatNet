@@ -1,0 +1,230 @@
+from __future__ import annotations
+
+import socket
+import time
+import uuid
+from typing import Any
+
+import oqs
+
+from .authority import load_authority_public, verify_bundle
+from .constants import DEFAULT_TIMEOUT
+from .crypto import decrypt_layer, derive_hop_keys, encrypt_layer
+from .directory import fetch_bundle_from_directory
+from .util import atomic_write_json, b64d, b64e, load_json
+from .wire import recv_msg, send_msg
+
+
+def build_client_state(route: list[dict[str, Any]]) -> dict[str, Any]:
+    circuit_id = str(uuid.uuid4())
+    hop_ciphertexts: list[str] = []
+    forward_keys: list[str] = []
+    reverse_keys: list[str] = []
+
+    for relay in route:
+        with oqs.KeyEncapsulation(relay["kemalg"]) as kem:
+            ciphertext, shared_secret = kem.encap_secret(b64d(relay["public_key"]))
+
+        hop_ciphertexts.append(b64e(ciphertext))
+        forward_key, reverse_key = derive_hop_keys(shared_secret, circuit_id, relay["name"])
+        forward_keys.append(b64e(forward_key))
+        reverse_keys.append(b64e(reverse_key))
+
+    layer = encrypt_layer(b64d(forward_keys[-1]), {"cmd": "EXIT_READY"})
+
+    for i in range(len(route) - 2, -1, -1):
+        layer = encrypt_layer(
+            b64d(forward_keys[i]),
+            {
+                "cmd": "FORWARD_BUILD",
+                "next": {
+                    "name": route[i + 1]["name"],
+                    "host": route[i + 1]["host"],
+                    "port": route[i + 1]["port"],
+                },
+                "next_ct": hop_ciphertexts[i + 1],
+                "inner": layer,
+            },
+        )
+
+    return {
+        "version": 1,
+        "circuit_id": circuit_id,
+        "created_at": time.time(),
+        "route": [
+            {
+                "name": relay["name"],
+                "host": relay["host"],
+                "port": relay["port"],
+                "kemalg": relay["kemalg"],
+                "public_key": relay["public_key"],
+            }
+            for relay in route
+        ],
+        "forward_keys": forward_keys,
+        "reverse_keys": reverse_keys,
+        "next_seq": {},
+        "build_message": {
+            "type": "BUILD",
+            "circuit_id": circuit_id,
+            "ct": hop_ciphertexts[0],
+            "layer": layer,
+        },
+    }
+
+
+def open_guard_socket(route: list[dict[str, Any]]) -> tuple[str, int]:
+    guard = route[0]
+    return guard["host"], guard["port"]
+
+
+def resolve_route_from_sources(
+    authority_pub_path: str,
+    route_names: list[str],
+    bundle_path: str | None = None,
+    directory_host: str | None = None,
+    directory_port: int = 9200,
+) -> list[dict[str, Any]]:
+    authority_pub = load_authority_public(authority_pub_path)
+
+    if bundle_path:
+        bundle = load_json(bundle_path)
+    else:
+        if not directory_host:
+            raise ValueError("either bundle_path or directory_host is required")
+        bundle = fetch_bundle_from_directory(directory_host, directory_port)
+
+    verified_relays = verify_bundle(bundle, authority_pub)
+
+    route: list[dict[str, Any]] = []
+    for name in route_names:
+        relay = verified_relays.get(name)
+        if relay is None:
+            available = ", ".join(sorted(verified_relays))
+            raise ValueError(f"relay {name!r} not found in verified bundle. available: {available}")
+        route.append(relay)
+
+    if not route:
+        raise ValueError("need at least one route name")
+
+    return route
+
+
+def client_build_circuit(
+    authority_pub_path: str,
+    route_names: list[str],
+    bundle_path: str | None = None,
+    directory_host: str | None = None,
+    directory_port: int = 9200,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    route = resolve_route_from_sources(
+        authority_pub_path=authority_pub_path,
+        route_names=route_names,
+        bundle_path=bundle_path,
+        directory_host=directory_host,
+        directory_port=directory_port,
+    )
+
+    state = build_client_state(route)
+    guard_host, guard_port = open_guard_socket(state["route"])
+
+    with socket.create_connection((guard_host, guard_port), timeout=DEFAULT_TIMEOUT) as sock:
+        send_msg(sock, state["build_message"])
+        response = recv_msg(sock)
+
+    if not response.get("ok"):
+        return state, response
+
+    state.pop("build_message", None)
+    return state, response
+
+
+def load_client_state(path: str) -> dict[str, Any]:
+    return load_json(path)
+
+
+def save_client_state(path: str, state: dict[str, Any]) -> None:
+    atomic_write_json(path, state)
+
+
+def build_forward_cell_layer(forward_keys_b64: list[str], cell: dict[str, Any]) -> dict[str, str]:
+    layer = encrypt_layer(
+        b64d(forward_keys_b64[-1]),
+        {
+            "cmd": "EXIT_CELL",
+            "cell": cell,
+        },
+    )
+
+    for i in range(len(forward_keys_b64) - 2, -1, -1):
+        layer = encrypt_layer(
+            b64d(forward_keys_b64[i]),
+            {
+                "cmd": "FORWARD_CELL",
+                "inner": layer,
+            },
+        )
+
+    return layer
+
+
+def peel_reply_onion(reverse_keys_b64: list[str], reply_layer: dict[str, str]) -> dict[str, Any]:
+    current = reply_layer
+
+    for i, reverse_key_b64 in enumerate(reverse_keys_b64):
+        decoded = decrypt_layer(b64d(reverse_key_b64), current)
+        is_last = i == len(reverse_keys_b64) - 1
+
+        if is_last:
+            if decoded["cmd"] != "REPLY_CELL":
+                raise ValueError(f"expected REPLY_CELL at exit layer, got {decoded['cmd']}")
+            return decoded["cell"]
+
+        if decoded["cmd"] != "RELAY_BACK":
+            raise ValueError(f"expected RELAY_BACK at hop {i}, got {decoded['cmd']}")
+        current = decoded["inner"]
+
+    raise ValueError("empty reverse path")
+
+
+def client_send_cell(
+    state: dict[str, Any],
+    stream_id: int,
+    cell_type: str,
+    payload: str = "",
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    seq_map = state.setdefault("next_seq", {})
+    seq = seq_map.get(str(stream_id), 0)
+
+    cell = {
+        "stream_id": stream_id,
+        "seq": seq,
+        "cell_type": cell_type,
+        "payload": payload,
+    }
+
+    layer = build_forward_cell_layer(state["forward_keys"], cell)
+    wire_msg = {
+        "type": "CELL",
+        "circuit_id": state["circuit_id"],
+        "layer": layer,
+    }
+
+    guard_host, guard_port = open_guard_socket(state["route"])
+    with socket.create_connection((guard_host, guard_port), timeout=DEFAULT_TIMEOUT) as sock:
+        send_msg(sock, wire_msg)
+        response = recv_msg(sock)
+
+    if not response.get("ok"):
+        return state, response, {}
+
+    reply_cell = peel_reply_onion(state["reverse_keys"], response["reply_layer"])
+    seq_map[str(stream_id)] = seq + 1
+    return state, response, reply_cell
+
+
+def client_destroy_circuit(state: dict[str, Any]) -> dict[str, Any]:
+    guard_host, guard_port = open_guard_socket(state["route"])
+    with socket.create_connection((guard_host, guard_port), timeout=DEFAULT_TIMEOUT) as sock:
+        send_msg(sock, {"type": "DESTROY", "circuit_id": state["circuit_id"]})
+        return recv_msg(sock)
