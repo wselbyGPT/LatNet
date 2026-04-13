@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from .crypto import decrypt_layer, derive_aead_key, derive_hop_keys, encrypt_layer, hkdf_expand, hkdf_extract
+from .models.protocol import parse_get_bundle_request
 from .util import load_json
 from .wire import recv_msg, send_msg
 
@@ -20,6 +21,7 @@ class DirectoryServer:
         try:
             msg = recv_msg(conn)
             if msg.get("type") == "GET_BUNDLE":
+                parse_get_bundle_request(msg)
                 send_msg(conn, {"ok": True, "bundle": self.current_bundle()})
             else:
                 send_msg(conn, {"ok": False, "error": f"unknown message type {msg.get('type')}"})
