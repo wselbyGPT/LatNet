@@ -1,3 +1,10 @@
+from .hidden_service import (
+    derive_lettuce_name,
+    derive_lettuce_name_from_b64,
+    is_valid_lettuce_name,
+    parse_lettuce_name,
+)
+
 from .protocol import (
     BuildEnvelope,
     CellEnvelope,
@@ -19,6 +26,10 @@ from .protocol import (
 )
 
 __all__ = [
+    "parse_lettuce_name",
+    "is_valid_lettuce_name",
+    "derive_lettuce_name_from_b64",
+    "derive_lettuce_name",
     "BuildEnvelope",
     "CellEnvelope",
     "DestroyEnvelope",
