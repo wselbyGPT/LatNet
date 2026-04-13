@@ -34,10 +34,57 @@ def init_relay_file(name: str, host: str, port: int, out_path: str | Path) -> di
 
 
 class RelayServer:
-    def __init__(self, relay_doc: dict[str, Any]):
+    def __init__(
+        self,
+        relay_doc: dict[str, Any],
+        *,
+        use_persistent_channels: bool = False,
+        circuit_ttl_seconds: float = 900.0,
+        circuit_idle_seconds: float = 300.0,
+        stream_idle_seconds: float = 120.0,
+    ):
         self.relay_doc = relay_doc
         self.circuits: dict[str, dict[str, Any]] = {}
         self.lock = threading.Lock()
+        self.use_persistent_channels = use_persistent_channels
+        self.circuit_ttl_seconds = max(float(circuit_ttl_seconds), 1.0)
+        self.circuit_idle_seconds = max(float(circuit_idle_seconds), 1.0)
+        self.stream_idle_seconds = max(float(stream_idle_seconds), 1.0)
+        self.channel_pool: dict[tuple[str, int], socket.socket] = {}
+        self.channel_pool_lock = threading.Lock()
+
+    @staticmethod
+    def _touch_state(state: dict[str, Any], now: float | None = None) -> None:
+        state["last_activity_at"] = time.time() if now is None else now
+
+    @staticmethod
+    def _init_lifecycle_state(state: dict[str, Any], lifecycle_state: str, now: float | None = None) -> None:
+        ts = time.time() if now is None else now
+        state["lifecycle_state"] = lifecycle_state
+        state["created_at"] = ts
+        state["last_activity_at"] = ts
+        state.setdefault("streams", {})
+
+    @staticmethod
+    def _transition_lifecycle_state(state: dict[str, Any], target: str, now: float | None = None) -> None:
+        valid_transitions = {
+            "building": {"ready", "destroying", "closed"},
+            "ready": {"destroying", "closed"},
+            "destroying": {"closed"},
+            "closed": set(),
+        }
+        current = str(state.get("lifecycle_state", "building"))
+        if target not in valid_transitions.get(current, set()) and target != current:
+            raise ValueError(f"invalid lifecycle transition: {current} -> {target}")
+        ts = time.time() if now is None else now
+        state["lifecycle_state"] = target
+        if target == "ready":
+            state["ready_at"] = ts
+        elif target == "destroying":
+            state["destroying_at"] = ts
+        elif target == "closed":
+            state["closed_at"] = ts
+        state["last_activity_at"] = ts
 
     def circuit_snapshot(self, circuit_id: str) -> dict[str, Any] | None:
         with self.lock:
@@ -139,6 +186,7 @@ class RelayServer:
                     "stream_id": stream_id,
                     "open": True,
                     "opened_at": time.time(),
+                    "last_activity_at": time.time(),
                     "last_seq": 0,
                     "next_seq": 1,
                     "seen_window": [],
@@ -177,6 +225,7 @@ class RelayServer:
                     }
                 else:
                     self._advance_seq_window(stream_state, seq)
+                    stream_state["last_activity_at"] = time.time()
                     self.update_stream_state(circuit_id, stream_id, stream_state)
                     reply_cell = {
                         "stream_id": stream_id,
@@ -212,6 +261,7 @@ class RelayServer:
                     self._advance_seq_window(stream_state, seq)
                     stream_state["open"] = False
                     stream_state["closed_at"] = time.time()
+                    stream_state["last_activity_at"] = time.time()
                     self.update_stream_state(circuit_id, stream_id, stream_state)
                     reply_cell = {
                         "stream_id": stream_id,
@@ -252,11 +302,63 @@ class RelayServer:
 
     def forward_to_next(self, state: dict[str, Any], msg: dict[str, Any]) -> dict[str, Any]:
         next_hop = state["next"]
-        with socket.create_connection((next_hop["host"], next_hop["port"]), timeout=DEFAULT_TIMEOUT) as sock:
-            send_msg(sock, msg)
-            return recv_msg(sock)
+        addr = (next_hop["host"], next_hop["port"])
+
+        if not self.use_persistent_channels:
+            with socket.create_connection(addr, timeout=DEFAULT_TIMEOUT) as sock:
+                send_msg(sock, msg)
+                return recv_msg(sock)
+
+        def _connect() -> socket.socket:
+            return socket.create_connection(addr, timeout=DEFAULT_TIMEOUT)
+
+        with self.channel_pool_lock:
+            pooled = self.channel_pool.get(addr)
+            if pooled is None:
+                pooled = _connect()
+                self.channel_pool[addr] = pooled
+
+        try:
+            send_msg(pooled, msg)
+            return recv_msg(pooled)
+        except Exception:
+            with self.channel_pool_lock:
+                try:
+                    pooled.close()
+                except Exception:
+                    pass
+                self.channel_pool.pop(addr, None)
+                replacement = _connect()
+                self.channel_pool[addr] = replacement
+            send_msg(replacement, msg)
+            return recv_msg(replacement)
+
+    def cleanup_stale_state(self, now: float | None = None) -> None:
+        ts = time.time() if now is None else now
+        with self.lock:
+            remove_circuits: list[str] = []
+            for circuit_id, state in self.circuits.items():
+                streams = state.setdefault("streams", {})
+                stale_streams = []
+                for sid, stream_state in streams.items():
+                    stream_last = float(stream_state.get("last_activity_at", stream_state.get("opened_at", ts)))
+                    if (ts - stream_last) >= self.stream_idle_seconds:
+                        stale_streams.append(sid)
+                for sid in stale_streams:
+                    streams.pop(sid, None)
+
+                created = float(state.get("created_at", ts))
+                last_activity = float(state.get("last_activity_at", created))
+                expired_ttl = (ts - created) >= self.circuit_ttl_seconds
+                expired_idle = (ts - last_activity) >= self.circuit_idle_seconds
+                if expired_ttl or expired_idle:
+                    remove_circuits.append(circuit_id)
+
+            for circuit_id in remove_circuits:
+                self.circuits.pop(circuit_id, None)
 
     def handle_build(self, msg: dict[str, Any]) -> dict[str, Any]:
+        self.cleanup_stale_state()
         env = parse_build_envelope(msg)
         circuit_id = env.circuit_id
         forward_key, reverse_key = self.relay_decap_and_keys(env.ct, circuit_id)
@@ -269,8 +371,8 @@ class RelayServer:
                 "reverse_key": b64e(reverse_key),
                 "next": {"host": layer.next.host, "port": layer.next.port},
                 "streams": {},
-                "created_at": time.time(),
             }
+            self._init_lifecycle_state(state, "building")
             self.set_circuit_state(circuit_id, state)
 
             next_build = {
@@ -279,7 +381,16 @@ class RelayServer:
                 "ct": layer.next_ct,
                 "layer": layer.inner,
             }
-            return self.forward_to_next(state, next_build)
+            response = self.forward_to_next(state, next_build)
+            if response.get("ok"):
+                self._transition_lifecycle_state(state, "ready")
+                self.set_circuit_state(circuit_id, state)
+            else:
+                self._transition_lifecycle_state(state, "destroying")
+                self._transition_lifecycle_state(state, "closed")
+                with self.lock:
+                    self.circuits.pop(circuit_id, None)
+            return response
 
         if layer.cmd == "EXIT_READY":
             state = {
@@ -287,8 +398,9 @@ class RelayServer:
                 "forward_key": b64e(forward_key),
                 "reverse_key": b64e(reverse_key),
                 "streams": {},
-                "created_at": time.time(),
             }
+            self._init_lifecycle_state(state, "building")
+            self._transition_lifecycle_state(state, "ready")
             self.set_circuit_state(circuit_id, state)
             print(f"[{self.relay_doc['name']}] circuit {circuit_id} ready as exit")
             return {"ok": True, "status": "circuit_built", "role": "exit"}
@@ -296,11 +408,17 @@ class RelayServer:
         return {"ok": False, "error": f"unknown build cmd: {layer.cmd}"}
 
     def handle_cell(self, msg: dict[str, Any]) -> dict[str, Any]:
+        self.cleanup_stale_state()
         env = parse_cell_envelope(msg)
         circuit_id = env.circuit_id
         state = self.circuit_snapshot(circuit_id)
         if state is None:
             return {"ok": False, "error": f"unknown circuit_id {circuit_id}"}
+        if state.get("lifecycle_state") != "ready":
+            return {"ok": False, "error": f"circuit {circuit_id} is not ready"}
+
+        self._touch_state(state)
+        self.set_circuit_state(circuit_id, state)
 
         forward_key = b64d(state["forward_key"])
         reverse_key = b64d(state["reverse_key"])
@@ -334,11 +452,16 @@ class RelayServer:
         return {"ok": False, "error": f"unknown circuit role {state['role']}"}
 
     def handle_destroy(self, msg: dict[str, Any]) -> dict[str, Any]:
+        self.cleanup_stale_state()
         env = parse_destroy_envelope(msg)
         circuit_id = env.circuit_id
         state = self.circuit_snapshot(circuit_id)
         if state is None:
             return {"ok": True, "status": "already_gone"}
+
+        state["streams"] = {}
+        self._transition_lifecycle_state(state, "destroying")
+        self.set_circuit_state(circuit_id, state)
 
         if state["role"] == "forward":
             try:
@@ -346,6 +469,7 @@ class RelayServer:
             except Exception:
                 pass
 
+        self._transition_lifecycle_state(state, "closed")
         with self.lock:
             self.circuits.pop(circuit_id, None)
 
@@ -383,7 +507,13 @@ def run_relay_server(relay_path: str) -> None:
     relay_doc = load_json(relay_path)
     host = relay_doc["host"]
     port = relay_doc["port"]
-    server = RelayServer(relay_doc)
+    server = RelayServer(
+        relay_doc,
+        use_persistent_channels=bool(relay_doc.get("use_persistent_channels", False)),
+        circuit_ttl_seconds=float(relay_doc.get("circuit_ttl_seconds", 900.0)),
+        circuit_idle_seconds=float(relay_doc.get("circuit_idle_seconds", 300.0)),
+        stream_idle_seconds=float(relay_doc.get("stream_idle_seconds", 120.0)),
+    )
 
     print(f"Starting relay {relay_doc['name']} on {host}:{port} using {relay_doc['kemalg']}")
 
