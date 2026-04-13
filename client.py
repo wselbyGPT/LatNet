@@ -15,9 +15,14 @@ def fetch_bundle_from_directory(host: str, port: int = 9200) -> dict[str, Any]:
         send_msg(sock, {"type": "GET_BUNDLE"})
         response = recv_msg(sock)
 
+    if not isinstance(response, dict):
+        raise ValueError("directory response must be an object")
     if not response.get("ok"):
         raise ValueError(response.get("error", "directory returned error"))
-    return response["bundle"]
+    bundle = response.get("bundle")
+    if not isinstance(bundle, dict):
+        raise ValueError("directory response missing bundle")
+    return bundle
 
 
 def fetch_bundle_to_file(host: str, port: int, out_path: str) -> dict[str, Any]:

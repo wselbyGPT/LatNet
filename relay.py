@@ -11,6 +11,7 @@ import oqs
 
 from .constants import DEFAULT_TIMEOUT, KEMALG
 from .crypto import decrypt_layer, derive_hop_keys, encrypt_layer
+from .models.protocol import parse_build_envelope, parse_cell_envelope, parse_destroy_envelope, parse_exit_cell_layer, parse_layer
 from .util import atomic_write_json, b64d, b64e, load_json
 from .wire import recv_msg, send_msg
 
@@ -79,10 +80,11 @@ class RelayServer:
         }
 
     def handle_exit_cell(self, circuit_id: str, state: dict[str, Any], cell: dict[str, Any]) -> dict[str, Any]:
-        stream_id = cell["stream_id"]
-        seq = cell["seq"]
-        cell_type = cell["cell_type"]
-        payload = cell.get("payload", "")
+        parsed_cell = parse_exit_cell_layer({"cmd": "EXIT_CELL", "cell": cell}).cell
+        stream_id = parsed_cell.stream_id
+        seq = parsed_cell.seq
+        cell_type = parsed_cell.cell_type
+        payload = parsed_cell.payload
 
         streams = state.setdefault("streams", {})
         sid = str(stream_id)
@@ -172,16 +174,17 @@ class RelayServer:
             return recv_msg(sock)
 
     def handle_build(self, msg: dict[str, Any]) -> dict[str, Any]:
-        circuit_id = msg["circuit_id"]
-        forward_key, reverse_key = self.relay_decap_and_keys(msg["ct"], circuit_id)
-        layer = decrypt_layer(forward_key, msg["layer"])
+        env = parse_build_envelope(msg)
+        circuit_id = env.circuit_id
+        forward_key, reverse_key = self.relay_decap_and_keys(env.ct, circuit_id)
+        layer = parse_layer(decrypt_layer(forward_key, env.layer))
 
-        if layer["cmd"] == "FORWARD_BUILD":
+        if layer.cmd == "FORWARD_BUILD":
             state = {
                 "role": "forward",
                 "forward_key": b64e(forward_key),
                 "reverse_key": b64e(reverse_key),
-                "next": layer["next"],
+                "next": {"host": layer.next.host, "port": layer.next.port},
                 "streams": {},
                 "created_at": time.time(),
             }
@@ -190,12 +193,12 @@ class RelayServer:
             next_build = {
                 "type": "BUILD",
                 "circuit_id": circuit_id,
-                "ct": layer["next_ct"],
-                "layer": layer["inner"],
+                "ct": layer.next_ct,
+                "layer": layer.inner,
             }
             return self.forward_to_next(state, next_build)
 
-        if layer["cmd"] == "EXIT_READY":
+        if layer.cmd == "EXIT_READY":
             state = {
                 "role": "exit",
                 "forward_key": b64e(forward_key),
@@ -207,39 +210,46 @@ class RelayServer:
             print(f"[{self.relay_doc['name']}] circuit {circuit_id} ready as exit")
             return {"ok": True, "status": "circuit_built", "role": "exit"}
 
-        return {"ok": False, "error": f"unknown build cmd: {layer['cmd']}"}
+        return {"ok": False, "error": f"unknown build cmd: {layer.cmd}"}
 
     def handle_cell(self, msg: dict[str, Any]) -> dict[str, Any]:
-        circuit_id = msg["circuit_id"]
+        env = parse_cell_envelope(msg)
+        circuit_id = env.circuit_id
         state = self.circuit_snapshot(circuit_id)
         if state is None:
             return {"ok": False, "error": f"unknown circuit_id {circuit_id}"}
 
         forward_key = b64d(state["forward_key"])
         reverse_key = b64d(state["reverse_key"])
-        layer = decrypt_layer(forward_key, msg["layer"])
+        layer = parse_layer(decrypt_layer(forward_key, env.layer))
 
         if state["role"] == "forward":
-            if layer["cmd"] != "FORWARD_CELL":
-                return {"ok": False, "error": f"expected FORWARD_CELL, got {layer['cmd']}"}
+            if layer.cmd != "FORWARD_CELL":
+                return {"ok": False, "error": f"expected FORWARD_CELL, got {layer.cmd}"}
 
             next_msg = {
                 "type": "CELL",
                 "circuit_id": circuit_id,
-                "layer": layer["inner"],
+                "layer": layer.inner,
             }
             next_response = self.forward_to_next(state, next_msg)
             return self.wrap_reverse_hop(reverse_key, next_response)
 
         if state["role"] == "exit":
-            if layer["cmd"] != "EXIT_CELL":
-                return {"ok": False, "error": f"expected EXIT_CELL, got {layer['cmd']}"}
-            return self.handle_exit_cell(circuit_id, state, layer["cell"])
+            if layer.cmd != "EXIT_CELL":
+                return {"ok": False, "error": f"expected EXIT_CELL, got {layer.cmd}"}
+            return self.handle_exit_cell(circuit_id, state, {
+                "stream_id": layer.cell.stream_id,
+                "seq": layer.cell.seq,
+                "cell_type": layer.cell.cell_type,
+                "payload": layer.cell.payload,
+            })
 
         return {"ok": False, "error": f"unknown circuit role {state['role']}"}
 
     def handle_destroy(self, msg: dict[str, Any]) -> dict[str, Any]:
-        circuit_id = msg["circuit_id"]
+        env = parse_destroy_envelope(msg)
+        circuit_id = env.circuit_id
         state = self.circuit_snapshot(circuit_id)
         if state is None:
             return {"ok": True, "status": "already_gone"}
@@ -259,7 +269,7 @@ class RelayServer:
     def handle_conn(self, conn: socket.socket) -> None:
         try:
             msg = recv_msg(conn)
-            msg_type = msg["type"]
+            msg_type = msg.get("type")
 
             if msg_type == "BUILD":
                 response = self.handle_build(msg)

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import socket
+import threading
+
 
 def _exit_cell_msg(crypto_mod, forward_key, circuit_id, cell):
     return {
@@ -114,3 +117,45 @@ def test_destroy_idempotency(latnet_modules, relay_doc_fixture, mock_key_materia
 
     assert first == {"ok": True, "status": "destroyed"}
     assert second == {"ok": True, "status": "already_gone"}
+
+
+def _run_relay_handle_conn(server, conn):
+    t = threading.Thread(target=server.handle_conn, args=(conn,), daemon=True)
+    t.start()
+    return t
+
+
+def test_handle_conn_rejects_missing_required_fields(latnet_modules, relay_doc_fixture):
+    relay_mod = latnet_modules["relay"]
+    wire = latnet_modules["wire"]
+
+    server = relay_mod.RelayServer(relay_doc_fixture)
+    client_sock, server_sock = socket.socketpair()
+    try:
+        thread = _run_relay_handle_conn(server, server_sock)
+        wire.send_msg(client_sock, {"type": "BUILD", "ct": "abc", "layer": {"nonce": "n", "ct": "c"}})
+        response = wire.recv_msg(client_sock)
+        thread.join(timeout=1)
+
+        assert response["ok"] is False
+        assert "missing or invalid field: circuit_id" in response["error"]
+    finally:
+        client_sock.close()
+
+
+def test_handle_conn_unknown_type_cli_compatible(latnet_modules, relay_doc_fixture):
+    relay_mod = latnet_modules["relay"]
+    wire = latnet_modules["wire"]
+
+    server = relay_mod.RelayServer(relay_doc_fixture)
+    client_sock, server_sock = socket.socketpair()
+    try:
+        thread = _run_relay_handle_conn(server, server_sock)
+        wire.send_msg(client_sock, {"type": "NOPE"})
+        response = wire.recv_msg(client_sock)
+        thread.join(timeout=1)
+
+        assert response["ok"] is False
+        assert response["error"] == "unknown message type NOPE"
+    finally:
+        client_sock.close()

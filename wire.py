@@ -18,7 +18,10 @@ def send_msg(sock: socket.socket, obj: dict[str, Any]) -> None:
 def recv_msg(sock: socket.socket) -> dict[str, Any]:
     length = struct.unpack("!I", recv_exact(sock, 4))[0]
     blob = recv_exact(sock, length)
-    return json.loads(blob.decode("utf-8"))
+    msg = json.loads(blob.decode("utf-8"))
+    if not isinstance(msg, dict):
+        raise ValueError("wire message must be an object")
+    return msg
 
 
 __all__ = [
