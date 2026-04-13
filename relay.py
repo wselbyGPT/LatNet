@@ -60,6 +60,35 @@ class RelayServer:
             else:
                 streams[sid] = stream_state
 
+    @staticmethod
+    def _advance_seq_window(stream_state: dict[str, Any], seq: int, window_size: int = 32) -> None:
+        window = list(stream_state.get("seen_window", []))
+        window.append(seq)
+        if len(window) > window_size:
+            window = window[-window_size:]
+        stream_state["seen_window"] = window
+        stream_state["last_seq"] = seq
+        stream_state["next_seq"] = seq + 1
+
+    @staticmethod
+    def _validate_monotonic_seq(stream_state: dict[str, Any], seq: int) -> str | None:
+        window = stream_state.get("seen_window", [])
+        if seq in window:
+            return f"duplicate seq {seq} for stream {stream_state['stream_id']}"
+        last_seq = int(stream_state.get("last_seq", -1))
+        expected = int(stream_state.get("next_seq", last_seq + 1))
+        if seq < expected:
+            return (
+                f"stale/out-of-order seq {seq} for stream {stream_state['stream_id']}; "
+                f"expected {expected}"
+            )
+        if seq > expected:
+            return (
+                f"skipped seq {seq} for stream {stream_state['stream_id']}; "
+                f"expected {expected}"
+            )
+        return None
+
     def relay_decap_and_keys(self, ct_b64: str, circuit_id: str) -> tuple[bytes, bytes]:
         with oqs.KeyEncapsulation(self.relay_doc["kemalg"], b64d(self.relay_doc["secret_key"])) as kem:
             shared_secret = kem.decap_secret(b64d(ct_b64))
@@ -91,20 +120,39 @@ class RelayServer:
         stream_state = streams.get(sid)
 
         if cell_type == "BEGIN":
-            stream_state = {
-                "open": True,
-                "opened_at": time.time(),
-                "last_seq": seq,
-            }
-            self.update_stream_state(circuit_id, stream_id, stream_state)
-            reply_cell = {
-                "stream_id": stream_id,
-                "seq": seq,
-                "cell_type": "CONNECTED",
-                "payload": f"stream {stream_id} opened at exit {self.relay_doc['name']}",
-            }
+            if stream_state is not None:
+                reply_cell = {
+                    "stream_id": stream_id,
+                    "seq": seq,
+                    "cell_type": "ERROR",
+                    "payload": f"stream {stream_id} already exists",
+                }
+            elif seq != 1:
+                reply_cell = {
+                    "stream_id": stream_id,
+                    "seq": seq,
+                    "cell_type": "ERROR",
+                    "payload": f"invalid initial seq {seq} for stream {stream_id}; expected 1",
+                }
+            else:
+                stream_state = {
+                    "stream_id": stream_id,
+                    "open": True,
+                    "opened_at": time.time(),
+                    "last_seq": 0,
+                    "next_seq": 1,
+                    "seen_window": [],
+                }
+                self._advance_seq_window(stream_state, seq)
+                self.update_stream_state(circuit_id, stream_id, stream_state)
+                reply_cell = {
+                    "stream_id": stream_id,
+                    "seq": seq,
+                    "cell_type": "CONNECTED",
+                    "payload": f"stream {stream_id} opened at exit {self.relay_doc['name']}",
+                }
         elif cell_type == "DATA":
-            if not stream_state or not stream_state.get("open"):
+            if not stream_state:
                 reply_cell = {
                     "stream_id": stream_id,
                     "seq": seq,
@@ -112,16 +160,32 @@ class RelayServer:
                     "payload": f"stream {stream_id} is not open",
                 }
             else:
-                stream_state["last_seq"] = seq
-                self.update_stream_state(circuit_id, stream_id, stream_state)
-                reply_cell = {
-                    "stream_id": stream_id,
-                    "seq": seq,
-                    "cell_type": "DATA",
-                    "payload": f"echo[{stream_id}] {payload}",
-                }
+                seq_error = self._validate_monotonic_seq(stream_state, seq)
+                if seq_error:
+                    reply_cell = {
+                        "stream_id": stream_id,
+                        "seq": seq,
+                        "cell_type": "ERROR",
+                        "payload": seq_error,
+                    }
+                elif not stream_state.get("open"):
+                    reply_cell = {
+                        "stream_id": stream_id,
+                        "seq": seq,
+                        "cell_type": "ERROR",
+                        "payload": f"stream {stream_id} is not open",
+                    }
+                else:
+                    self._advance_seq_window(stream_state, seq)
+                    self.update_stream_state(circuit_id, stream_id, stream_state)
+                    reply_cell = {
+                        "stream_id": stream_id,
+                        "seq": seq,
+                        "cell_type": "DATA",
+                        "payload": f"echo[{stream_id}] {payload}",
+                    }
         elif cell_type == "END":
-            if not stream_state or not stream_state.get("open"):
+            if not stream_state:
                 reply_cell = {
                     "stream_id": stream_id,
                     "seq": seq,
@@ -129,13 +193,32 @@ class RelayServer:
                     "payload": f"stream {stream_id} was already closed",
                 }
             else:
-                self.update_stream_state(circuit_id, stream_id, None)
-                reply_cell = {
-                    "stream_id": stream_id,
-                    "seq": seq,
-                    "cell_type": "ENDED",
-                    "payload": f"stream {stream_id} closed at exit {self.relay_doc['name']}",
-                }
+                seq_error = self._validate_monotonic_seq(stream_state, seq)
+                if seq_error:
+                    reply_cell = {
+                        "stream_id": stream_id,
+                        "seq": seq,
+                        "cell_type": "ERROR",
+                        "payload": seq_error,
+                    }
+                elif not stream_state.get("open"):
+                    reply_cell = {
+                        "stream_id": stream_id,
+                        "seq": seq,
+                        "cell_type": "ENDED",
+                        "payload": f"stream {stream_id} was already closed",
+                    }
+                else:
+                    self._advance_seq_window(stream_state, seq)
+                    stream_state["open"] = False
+                    stream_state["closed_at"] = time.time()
+                    self.update_stream_state(circuit_id, stream_id, stream_state)
+                    reply_cell = {
+                        "stream_id": stream_id,
+                        "seq": seq,
+                        "cell_type": "ENDED",
+                        "payload": f"stream {stream_id} closed at exit {self.relay_doc['name']}",
+                    }
         else:
             reply_cell = {
                 "stream_id": stream_id,
@@ -226,12 +309,15 @@ class RelayServer:
         if state["role"] == "forward":
             if layer.cmd != "FORWARD_CELL":
                 return {"ok": False, "error": f"expected FORWARD_CELL, got {layer.cmd}"}
+            if not isinstance(layer.inner, dict) or set(layer.inner.keys()) != {"nonce", "ct"}:
+                return {"ok": False, "error": "invalid FORWARD_CELL inner layer"}
 
             next_msg = {
                 "type": "CELL",
                 "circuit_id": circuit_id,
                 "layer": layer.inner,
             }
+            parse_cell_envelope(next_msg)
             next_response = self.forward_to_next(state, next_msg)
             return self.wrap_reverse_hop(reverse_key, next_response)
 
