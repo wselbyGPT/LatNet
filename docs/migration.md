@@ -1,7 +1,6 @@
 # Milestone import migration note
 
-This milestone aligns modules with their canonical responsibility while keeping legacy
-import paths available via re-exports.
+This milestone aligns modules with their canonical responsibility.
 
 ## Canonical modules
 
@@ -16,12 +15,5 @@ import paths available via re-exports.
 
 ## Backward compatibility
 
-Legacy paths continue to work for this milestone through compatibility shims:
-
-- constants still available from `wire`.
-- wire helpers still available from `authority`.
-- crypto helpers still available from `directory`.
-- directory server symbols still available from `client`.
-- relay server symbols remain exported by `cli`.
-
-These shims are intentionally temporary and should be removed in a future cleanup release.
+Legacy compatibility re-exports were temporary for migration and have now been removed.
+Callers should import from canonical modules listed above.

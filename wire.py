@@ -5,7 +5,6 @@ import socket
 import struct
 from typing import Any
 
-from .constants import APP_SALT, AUTH_SIGALG, DEFAULT_TIMEOUT, KEMALG
 from .util import canonical_bytes, recv_exact
 
 
@@ -27,9 +26,4 @@ def recv_msg(sock: socket.socket) -> dict[str, Any]:
 __all__ = [
     "send_msg",
     "recv_msg",
-    # deprecated constants import-surface compatibility
-    "KEMALG",
-    "AUTH_SIGALG",
-    "APP_SALT",
-    "DEFAULT_TIMEOUT",
 ]

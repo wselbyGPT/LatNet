@@ -8,7 +8,6 @@ import oqs
 
 from .constants import DEFAULT_TIMEOUT
 from .crypto import decrypt_layer, derive_hop_keys, encrypt_layer
-from .directory import DirectoryServer, run_directory_server
 from .models.hidden_service import parse_lettuce_name
 from .models.hidden_service_descriptor import verify_hidden_service_descriptor_v2
 from .util import atomic_write_json, b64d, b64e
@@ -288,7 +287,4 @@ __all__ = [
     "destroy_circuit",
     "demo_circuit_echo",
     "CircuitSession",
-    # deprecated directory-server import compatibility
-    "DirectoryServer",
-    "run_directory_server",
 ]

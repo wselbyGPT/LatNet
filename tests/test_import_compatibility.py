@@ -18,9 +18,9 @@ def test_canonical_import_surface(latnet_modules):
             assert hasattr(module, symbol), f"{module_name} missing {symbol}"
 
 
-def test_deprecated_import_paths_remain_available(latnet_modules):
-    assert hasattr(latnet_modules["wire"], "KEMALG")
-    assert hasattr(latnet_modules["authority"], "send_msg")
-    assert hasattr(latnet_modules["directory"], "encrypt_layer")
-    assert hasattr(latnet_modules["client"], "DirectoryServer")
+def test_removed_deprecated_import_paths(latnet_modules):
+    assert not hasattr(latnet_modules["wire"], "KEMALG")
+    assert not hasattr(latnet_modules["authority"], "send_msg")
+    assert not hasattr(latnet_modules["directory"], "encrypt_layer")
+    assert not hasattr(latnet_modules["client"], "DirectoryServer")
     assert hasattr(latnet_modules["cli"], "RelayServer")
