@@ -14,7 +14,7 @@ from cryptography.hazmat.primitives.serialization import (
 
 from .constants import AUTH_SIGALG
 from .util import atomic_write_json, b64d, b64e, canonical_bytes, load_json, sha256_hex
-from .wire import recv_msg, send_msg
+from . import wire
 
 
 def authority_key_id_from_public(public_key_b64: str) -> str:
@@ -183,7 +183,4 @@ __all__ = [
     "verify_descriptor",
     "verify_bundle",
     "make_bundle_file",
-    # deprecated wire import compatibility
-    "send_msg",
-    "recv_msg",
 ]

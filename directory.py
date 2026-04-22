@@ -4,12 +4,11 @@ import socket
 from pathlib import Path
 from typing import Any
 
-from .crypto import decrypt_layer, derive_aead_key, derive_hop_keys, encrypt_layer, hkdf_expand, hkdf_extract
 from .models.hidden_service import parse_lettuce_name
 from .models.hidden_service_descriptor import verify_hidden_service_descriptor_v2
 from .models.protocol import parse_get_bundle_request, parse_get_hidden_service_descriptor_request
 from .util import load_json
-from .wire import recv_msg, send_msg
+from . import wire
 
 
 class DirectoryServer:
@@ -38,23 +37,23 @@ class DirectoryServer:
 
     def handle_conn(self, conn: socket.socket) -> None:
         try:
-            msg = recv_msg(conn)
+            msg = wire.recv_msg(conn)
             if msg.get("type") == "GET_BUNDLE":
                 parse_get_bundle_request(msg)
-                send_msg(conn, {"ok": True, "bundle": self.current_bundle()})
+                wire.send_msg(conn, {"ok": True, "bundle": self.current_bundle()})
             elif msg.get("type") == "GET_HS_DESCRIPTOR":
                 service_name = parse_get_hidden_service_descriptor_request(msg)
                 parse_lettuce_name(service_name)
                 descriptor = self.current_hidden_service_descriptors().get(service_name)
                 if descriptor is None:
-                    send_msg(conn, {"ok": False, "error": f"hidden service descriptor not found: {service_name}"})
+                    wire.send_msg(conn, {"ok": False, "error": f"hidden service descriptor not found: {service_name}"})
                 else:
-                    send_msg(conn, {"ok": True, "service_name": service_name, "descriptor": descriptor})
+                    wire.send_msg(conn, {"ok": True, "service_name": service_name, "descriptor": descriptor})
             else:
-                send_msg(conn, {"ok": False, "error": f"unknown message type {msg.get('type')}"})
+                wire.send_msg(conn, {"ok": False, "error": f"unknown message type {msg.get('type')}"})
         except Exception as exc:
             try:
-                send_msg(conn, {"ok": False, "error": str(exc)})
+                wire.send_msg(conn, {"ok": False, "error": str(exc)})
             except Exception:
                 pass
         finally:
@@ -86,11 +85,4 @@ def run_directory_server(
 __all__ = [
     "DirectoryServer",
     "run_directory_server",
-    # deprecated crypto import compatibility
-    "hkdf_extract",
-    "hkdf_expand",
-    "derive_aead_key",
-    "derive_hop_keys",
-    "encrypt_layer",
-    "decrypt_layer",
 ]
