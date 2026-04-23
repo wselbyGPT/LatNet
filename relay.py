@@ -478,29 +478,52 @@ class RelayServer:
         layer_cmd = decoded_layer.get("cmd") if isinstance(decoded_layer, dict) else None
 
         if state["role"] == "intro":
-            if layer_cmd != "INTRODUCE":
-                return {"ok": False, "error": f"expected INTRODUCE, got {layer_cmd}"}
-            cookie = decoded_layer.get("rendezvous_cookie")
-            if not isinstance(cookie, str) or not cookie:
-                return {"ok": False, "error": "missing or invalid field: rendezvous_cookie"}
-            now = time.time()
-            with self.lock:
-                self.pending_introductions[cookie] = {
-                    "intro_circuit_id": circuit_id,
-                    "intro_payload": decoded_layer.get("introduction"),
-                    "created_at": now,
-                    "last_activity_at": now,
+            if layer_cmd == "INTRODUCE":
+                cookie = decoded_layer.get("rendezvous_cookie")
+                if not isinstance(cookie, str) or not cookie:
+                    return {"ok": False, "error": "missing or invalid field: rendezvous_cookie"}
+                now = time.time()
+                with self.lock:
+                    self.pending_introductions[cookie] = {
+                        "intro_circuit_id": circuit_id,
+                        "intro_payload": decoded_layer.get("introduction"),
+                        "created_at": now,
+                        "last_activity_at": now,
+                    }
+                return {
+                    "ok": True,
+                    "reply_layer": encrypt_layer(
+                        reverse_key,
+                        {
+                            "cmd": "INTRO_STORED",
+                            "rendezvous_cookie": cookie,
+                        },
+                    ),
                 }
-            return {
-                "ok": True,
-                "reply_layer": encrypt_layer(
-                    reverse_key,
-                    {
-                        "cmd": "INTRO_STORED",
-                        "rendezvous_cookie": cookie,
-                    },
-                ),
-            }
+
+            if layer_cmd == "INTRO_POLL":
+                with self.lock:
+                    pending = [
+                        {
+                            "rendezvous_cookie": cookie,
+                            "introduction": intro.get("intro_payload"),
+                        }
+                        for cookie, intro in self.pending_introductions.items()
+                    ]
+                    for entry in pending:
+                        self.pending_introductions.pop(entry["rendezvous_cookie"], None)
+                return {
+                    "ok": True,
+                    "reply_layer": encrypt_layer(
+                        reverse_key,
+                        {
+                            "cmd": "INTRO_PENDING",
+                            "items": pending,
+                        },
+                    ),
+                }
+
+            return {"ok": False, "error": f"unknown intro cmd {layer_cmd}"}
 
         if state["role"] == "rendezvous":
             if layer_cmd == "RENDEZVOUS_ESTABLISH":
@@ -521,8 +544,10 @@ class RelayServer:
                             "service_circuit_id": None,
                             "joined": False,
                             "relay_map": {},
+                            "mailboxes": {"client": [], "service": []},
                         },
                     )
+                    entry.setdefault("mailboxes", {"client": [], "service": []})
                     entry[f"{side}_circuit_id"] = circuit_id
                     entry["last_activity_at"] = now
                     if entry.get("client_circuit_id") and entry.get("service_circuit_id"):
@@ -572,6 +597,13 @@ class RelayServer:
                     if not link or link.get("cookie") != cookie:
                         return {"ok": False, "error": f"rendezvous not joined for cookie {cookie}"}
                     peer_circuit_id = link["peer_circuit_id"]
+                    entry = self.pending_rendezvous.get(cookie)
+                    if not entry:
+                        return {"ok": False, "error": f"rendezvous not joined for cookie {cookie}"}
+                    sender_side = "client" if entry.get("client_circuit_id") == circuit_id else "service"
+                    peer_side = "service" if sender_side == "client" else "client"
+                    mailboxes = entry.setdefault("mailboxes", {"client": [], "service": []})
+                    mailboxes.setdefault(peer_side, []).append(decoded_layer.get("payload", ""))
                     link["last_activity_at"] = time.time()
                     peer_link = self.rendezvous_links.get(peer_circuit_id)
                     if peer_link:
@@ -584,7 +616,35 @@ class RelayServer:
                             "cmd": "RENDEZVOUS_RELAYED",
                             "rendezvous_cookie": cookie,
                             "peer_circuit_id": peer_circuit_id,
-                            "payload": decoded_layer.get("payload", ""),
+                            "queued_for": peer_side,
+                        },
+                    ),
+                }
+
+            if layer_cmd == "RENDEZVOUS_RECV":
+                cookie = decoded_layer.get("rendezvous_cookie")
+                if not isinstance(cookie, str) or not cookie:
+                    return {"ok": False, "error": "missing or invalid field: rendezvous_cookie"}
+                with self.lock:
+                    link = self.rendezvous_links.get(circuit_id)
+                    if not link or link.get("cookie") != cookie:
+                        return {"ok": False, "error": f"rendezvous not joined for cookie {cookie}"}
+                    entry = self.pending_rendezvous.get(cookie)
+                    if not entry:
+                        return {"ok": False, "error": f"rendezvous not joined for cookie {cookie}"}
+                    side = "client" if entry.get("client_circuit_id") == circuit_id else "service"
+                    mailboxes = entry.setdefault("mailboxes", {"client": [], "service": []})
+                    queue = mailboxes.setdefault(side, [])
+                    payload = queue.pop(0) if queue else None
+                    entry["last_activity_at"] = time.time()
+                return {
+                    "ok": True,
+                    "reply_layer": encrypt_layer(
+                        reverse_key,
+                        {
+                            "cmd": "RENDEZVOUS_MESSAGE",
+                            "rendezvous_cookie": cookie,
+                            "payload": payload,
                         },
                     ),
                 }

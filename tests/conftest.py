@@ -147,6 +147,7 @@ def latnet_modules():
     client = _load_module("latnet.client", REPO_ROOT / "client.py")
     relay = _load_module("latnet.relay", REPO_ROOT / "relay.py")
     cli = _load_module("latnet.cli", REPO_ROOT / "cli.py")
+    hidden_service_runtime = _load_module("latnet.hidden_service_runtime", REPO_ROOT / "hidden_service_runtime.py")
     hidden_service_keys = _load_module("latnet.hidden_service_keys", REPO_ROOT / "hidden_service_keys.py")
     sys.modules.setdefault("hidden_service_keys", hidden_service_keys)
     hidden_service = _load_module("latnet.models.hidden_service", REPO_ROOT / "models" / "hidden_service.py")
@@ -163,6 +164,7 @@ def latnet_modules():
         "client": client,
         "relay": relay,
         "cli": cli,
+        "hidden_service_runtime": hidden_service_runtime,
         "models": models,
         "hidden_service_keys": hidden_service_keys,
         "models.hidden_service": hidden_service,
