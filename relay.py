@@ -52,6 +52,9 @@ class RelayServer:
         self.stream_idle_seconds = max(float(stream_idle_seconds), 1.0)
         self.channel_pool: dict[tuple[str, int], socket.socket] = {}
         self.channel_pool_lock = threading.Lock()
+        self.pending_introductions: dict[str, dict[str, Any]] = {}
+        self.pending_rendezvous: dict[str, dict[str, Any]] = {}
+        self.rendezvous_links: dict[str, dict[str, Any]] = {}
 
     @staticmethod
     def _touch_state(state: dict[str, Any], now: float | None = None) -> None:
@@ -357,6 +360,29 @@ class RelayServer:
             for circuit_id in remove_circuits:
                 self.circuits.pop(circuit_id, None)
 
+            stale_intro = [
+                cookie
+                for cookie, intro in self.pending_introductions.items()
+                if (ts - float(intro.get("last_activity_at", intro.get("created_at", ts)))) >= self.circuit_idle_seconds
+            ]
+            for cookie in stale_intro:
+                self.pending_introductions.pop(cookie, None)
+
+            stale_rendezvous = [
+                cookie
+                for cookie, rdv in self.pending_rendezvous.items()
+                if (ts - float(rdv.get("last_activity_at", rdv.get("created_at", ts)))) >= self.circuit_idle_seconds
+            ]
+            for cookie in stale_rendezvous:
+                entry = self.pending_rendezvous.pop(cookie, None)
+                if not entry:
+                    continue
+                relay_map = entry.get("relay_map", {})
+                for side in relay_map.values():
+                    peer_circuit_id = side.get("peer_circuit_id")
+                    if peer_circuit_id:
+                        self.rendezvous_links.pop(peer_circuit_id, None)
+
     def handle_build(self, msg: dict[str, Any]) -> dict[str, Any]:
         self.cleanup_stale_state()
         env = parse_build_envelope(msg)
@@ -405,6 +431,32 @@ class RelayServer:
             print(f"[{self.relay_doc['name']}] circuit {circuit_id} ready as exit")
             return {"ok": True, "status": "circuit_built", "role": "exit"}
 
+        if layer.cmd == "INTRO_READY":
+            state = {
+                "role": "intro",
+                "forward_key": b64e(forward_key),
+                "reverse_key": b64e(reverse_key),
+                "streams": {},
+            }
+            self._init_lifecycle_state(state, "building")
+            self._transition_lifecycle_state(state, "ready")
+            self.set_circuit_state(circuit_id, state)
+            print(f"[{self.relay_doc['name']}] circuit {circuit_id} ready as intro")
+            return {"ok": True, "status": "circuit_built", "role": "intro"}
+
+        if layer.cmd == "RENDEZVOUS_READY":
+            state = {
+                "role": "rendezvous",
+                "forward_key": b64e(forward_key),
+                "reverse_key": b64e(reverse_key),
+                "streams": {},
+            }
+            self._init_lifecycle_state(state, "building")
+            self._transition_lifecycle_state(state, "ready")
+            self.set_circuit_state(circuit_id, state)
+            print(f"[{self.relay_doc['name']}] circuit {circuit_id} ready as rendezvous")
+            return {"ok": True, "status": "circuit_built", "role": "rendezvous"}
+
         return {"ok": False, "error": f"unknown build cmd: {layer.cmd}"}
 
     def handle_cell(self, msg: dict[str, Any]) -> dict[str, Any]:
@@ -422,7 +474,124 @@ class RelayServer:
 
         forward_key = b64d(state["forward_key"])
         reverse_key = b64d(state["reverse_key"])
-        layer = parse_layer(decrypt_layer(forward_key, env.layer))
+        decoded_layer = decrypt_layer(forward_key, env.layer)
+        layer_cmd = decoded_layer.get("cmd") if isinstance(decoded_layer, dict) else None
+
+        if state["role"] == "intro":
+            if layer_cmd != "INTRODUCE":
+                return {"ok": False, "error": f"expected INTRODUCE, got {layer_cmd}"}
+            cookie = decoded_layer.get("rendezvous_cookie")
+            if not isinstance(cookie, str) or not cookie:
+                return {"ok": False, "error": "missing or invalid field: rendezvous_cookie"}
+            now = time.time()
+            with self.lock:
+                self.pending_introductions[cookie] = {
+                    "intro_circuit_id": circuit_id,
+                    "intro_payload": decoded_layer.get("introduction"),
+                    "created_at": now,
+                    "last_activity_at": now,
+                }
+            return {
+                "ok": True,
+                "reply_layer": encrypt_layer(
+                    reverse_key,
+                    {
+                        "cmd": "INTRO_STORED",
+                        "rendezvous_cookie": cookie,
+                    },
+                ),
+            }
+
+        if state["role"] == "rendezvous":
+            if layer_cmd == "RENDEZVOUS_ESTABLISH":
+                cookie = decoded_layer.get("rendezvous_cookie")
+                side = decoded_layer.get("side")
+                if not isinstance(cookie, str) or not cookie:
+                    return {"ok": False, "error": "missing or invalid field: rendezvous_cookie"}
+                if side not in {"client", "service"}:
+                    return {"ok": False, "error": "missing or invalid field: side"}
+                now = time.time()
+                with self.lock:
+                    entry = self.pending_rendezvous.setdefault(
+                        cookie,
+                        {
+                            "created_at": now,
+                            "last_activity_at": now,
+                            "client_circuit_id": None,
+                            "service_circuit_id": None,
+                            "joined": False,
+                            "relay_map": {},
+                        },
+                    )
+                    entry[f"{side}_circuit_id"] = circuit_id
+                    entry["last_activity_at"] = now
+                    if entry.get("client_circuit_id") and entry.get("service_circuit_id"):
+                        entry["joined"] = True
+                        entry["joined_at"] = now
+                        relay_map = {
+                            "client": {
+                                "circuit_id": entry["client_circuit_id"],
+                                "peer_circuit_id": entry["service_circuit_id"],
+                            },
+                            "service": {
+                                "circuit_id": entry["service_circuit_id"],
+                                "peer_circuit_id": entry["client_circuit_id"],
+                            },
+                        }
+                        entry["relay_map"] = relay_map
+                        self.rendezvous_links[entry["client_circuit_id"]] = {
+                            "cookie": cookie,
+                            "peer_circuit_id": entry["service_circuit_id"],
+                            "last_activity_at": now,
+                        }
+                        self.rendezvous_links[entry["service_circuit_id"]] = {
+                            "cookie": cookie,
+                            "peer_circuit_id": entry["client_circuit_id"],
+                            "last_activity_at": now,
+                        }
+                return {
+                    "ok": True,
+                    "reply_layer": encrypt_layer(
+                        reverse_key,
+                        {
+                            "cmd": "RENDEZVOUS_STATE",
+                            "rendezvous_cookie": cookie,
+                            "joined": bool(
+                                self.pending_rendezvous.get(cookie, {}).get("joined")
+                            ),
+                        },
+                    ),
+                }
+
+            if layer_cmd == "RENDEZVOUS_RELAY":
+                cookie = decoded_layer.get("rendezvous_cookie")
+                if not isinstance(cookie, str) or not cookie:
+                    return {"ok": False, "error": "missing or invalid field: rendezvous_cookie"}
+                with self.lock:
+                    link = self.rendezvous_links.get(circuit_id)
+                    if not link or link.get("cookie") != cookie:
+                        return {"ok": False, "error": f"rendezvous not joined for cookie {cookie}"}
+                    peer_circuit_id = link["peer_circuit_id"]
+                    link["last_activity_at"] = time.time()
+                    peer_link = self.rendezvous_links.get(peer_circuit_id)
+                    if peer_link:
+                        peer_link["last_activity_at"] = time.time()
+                return {
+                    "ok": True,
+                    "reply_layer": encrypt_layer(
+                        reverse_key,
+                        {
+                            "cmd": "RENDEZVOUS_RELAYED",
+                            "rendezvous_cookie": cookie,
+                            "peer_circuit_id": peer_circuit_id,
+                            "payload": decoded_layer.get("payload", ""),
+                        },
+                    ),
+                }
+
+            return {"ok": False, "error": f"unknown rendezvous cmd {layer_cmd}"}
+
+        layer = parse_layer(decoded_layer)
 
         if state["role"] == "forward":
             if layer.cmd != "FORWARD_CELL":
@@ -468,6 +637,29 @@ class RelayServer:
                 self.forward_to_next(state, {"type": "DESTROY", "circuit_id": circuit_id})
             except Exception:
                 pass
+
+        with self.lock:
+            remove_intro = [
+                cookie
+                for cookie, intro in self.pending_introductions.items()
+                if intro.get("intro_circuit_id") == circuit_id
+            ]
+            for cookie in remove_intro:
+                self.pending_introductions.pop(cookie, None)
+
+            link = self.rendezvous_links.pop(circuit_id, None)
+            if link:
+                cookie = link.get("cookie")
+                peer_circuit_id = link.get("peer_circuit_id")
+                if peer_circuit_id:
+                    self.rendezvous_links.pop(peer_circuit_id, None)
+                if isinstance(cookie, str):
+                    entry = self.pending_rendezvous.pop(cookie, None)
+                    if entry:
+                        for side in ("client_circuit_id", "service_circuit_id"):
+                            side_circuit_id = entry.get(side)
+                            if side_circuit_id:
+                                self.rendezvous_links.pop(side_circuit_id, None)
 
         self._transition_lifecycle_state(state, "closed")
         with self.lock:
