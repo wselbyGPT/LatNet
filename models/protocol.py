@@ -3,7 +3,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Literal
 
-LayerCmd = Literal["FORWARD_BUILD", "EXIT_READY", "FORWARD_CELL", "EXIT_CELL", "RELAY_BACK", "REPLY_CELL"]
+LayerCmd = Literal[
+    "FORWARD_BUILD",
+    "EXIT_READY",
+    "INTRO_READY",
+    "RENDEZVOUS_READY",
+    "FORWARD_CELL",
+    "EXIT_CELL",
+    "RELAY_BACK",
+    "REPLY_CELL",
+]
 StreamCellType = Literal["BEGIN", "DATA", "END", "CONNECTED", "ENDED", "ERROR"]
 
 
@@ -65,6 +74,16 @@ class ForwardBuildLayer:
 @dataclass(frozen=True)
 class ExitReadyLayer:
     cmd: Literal["EXIT_READY"]
+
+
+@dataclass(frozen=True)
+class IntroReadyLayer:
+    cmd: Literal["INTRO_READY"]
+
+
+@dataclass(frozen=True)
+class RendezvousReadyLayer:
+    cmd: Literal["RENDEZVOUS_READY"]
 
 
 @dataclass(frozen=True)
@@ -135,7 +154,9 @@ def parse_stream_cell(obj: Any) -> StreamCell:
     )
 
 
-def parse_layer(obj: Any) -> ForwardBuildLayer | ExitReadyLayer | ForwardCellLayer | ExitCellLayer:
+def parse_layer(
+    obj: Any,
+) -> ForwardBuildLayer | ExitReadyLayer | IntroReadyLayer | RendezvousReadyLayer | ForwardCellLayer | ExitCellLayer:
     src = _as_dict(obj, context="layer")
     cmd = _req_str(src, "cmd")
     if cmd == "FORWARD_BUILD":
@@ -148,6 +169,10 @@ def parse_layer(obj: Any) -> ForwardBuildLayer | ExitReadyLayer | ForwardCellLay
         )
     if cmd == "EXIT_READY":
         return ExitReadyLayer(cmd="EXIT_READY")
+    if cmd == "INTRO_READY":
+        return IntroReadyLayer(cmd="INTRO_READY")
+    if cmd == "RENDEZVOUS_READY":
+        return RendezvousReadyLayer(cmd="RENDEZVOUS_READY")
     if cmd == "FORWARD_CELL":
         return ForwardCellLayer(cmd="FORWARD_CELL", inner=_as_dict(src.get("inner"), context="inner"))
     if cmd == "EXIT_CELL":

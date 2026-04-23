@@ -21,8 +21,17 @@ def _exit_cell_msg(crypto_mod, forward_key, circuit_id, cell):
 def _decrypt_reply(crypto_mod, reverse_key, response):
     assert response["ok"] is True
     reply = crypto_mod.decrypt_layer(reverse_key, response["reply_layer"])
-    assert reply["cmd"] == "REPLY_CELL"
-    return reply["cell"]
+    if reply["cmd"] == "REPLY_CELL":
+        return reply["cell"]
+    return reply
+
+
+def _encrypted_cmd_msg(crypto_mod, forward_key, circuit_id, payload):
+    return {
+        "type": "CELL",
+        "circuit_id": circuit_id,
+        "layer": crypto_mod.encrypt_layer(forward_key, payload),
+    }
 
 
 def test_handle_cell_unknown_circuit(latnet_modules, relay_doc_fixture):
@@ -501,3 +510,137 @@ def test_destroy_clears_local_state_when_remote_destroy_fails(
 
     assert response == {"ok": True, "status": "destroyed"}
     assert server.circuit_snapshot(circuit_id) is None
+
+
+def test_intro_relay_stores_pending_introduction(latnet_modules, relay_doc_fixture, mock_key_material):
+    relay_mod = latnet_modules["relay"]
+    crypto_mod = latnet_modules["crypto"]
+
+    server = relay_mod.RelayServer(relay_doc_fixture)
+    circuit_id = "c-intro"
+    server.set_circuit_state(
+        circuit_id,
+        {
+            "role": "intro",
+            "forward_key": mock_key_material["forward_b64"],
+            "reverse_key": mock_key_material["reverse_b64"],
+            "streams": {},
+            "lifecycle_state": "ready",
+            "created_at": time.time(),
+            "last_activity_at": time.time(),
+        },
+    )
+
+    response = server.handle_cell(
+        _encrypted_cmd_msg(
+            crypto_mod,
+            mock_key_material["forward"],
+            circuit_id,
+            {"cmd": "INTRODUCE", "rendezvous_cookie": "cookie-1", "introduction": {"service": "alpha"}},
+        )
+    )
+
+    reply = _decrypt_reply(crypto_mod, mock_key_material["reverse"], response)
+    assert reply["cmd"] == "INTRO_STORED"
+    assert server.pending_introductions["cookie-1"]["intro_circuit_id"] == circuit_id
+
+
+def test_rendezvous_join_creates_bidirectional_mapping(latnet_modules, relay_doc_fixture, mock_key_material):
+    relay_mod = latnet_modules["relay"]
+    crypto_mod = latnet_modules["crypto"]
+
+    server = relay_mod.RelayServer(relay_doc_fixture)
+    client_circuit = "c-rdv-client"
+    service_circuit = "c-rdv-service"
+    for cid in (client_circuit, service_circuit):
+        server.set_circuit_state(
+            cid,
+            {
+                "role": "rendezvous",
+                "forward_key": mock_key_material["forward_b64"],
+                "reverse_key": mock_key_material["reverse_b64"],
+                "streams": {},
+                "lifecycle_state": "ready",
+                "created_at": time.time(),
+                "last_activity_at": time.time(),
+            },
+        )
+
+    client_resp = server.handle_cell(
+        _encrypted_cmd_msg(
+            crypto_mod,
+            mock_key_material["forward"],
+            client_circuit,
+            {"cmd": "RENDEZVOUS_ESTABLISH", "rendezvous_cookie": "cookie-2", "side": "client"},
+        )
+    )
+    client_reply = _decrypt_reply(crypto_mod, mock_key_material["reverse"], client_resp)
+    assert client_reply["joined"] is False
+
+    service_resp = server.handle_cell(
+        _encrypted_cmd_msg(
+            crypto_mod,
+            mock_key_material["forward"],
+            service_circuit,
+            {"cmd": "RENDEZVOUS_ESTABLISH", "rendezvous_cookie": "cookie-2", "side": "service"},
+        )
+    )
+    service_reply = _decrypt_reply(crypto_mod, mock_key_material["reverse"], service_resp)
+    assert service_reply["joined"] is True
+    assert server.pending_rendezvous["cookie-2"]["joined"] is True
+    assert server.rendezvous_links[client_circuit]["peer_circuit_id"] == service_circuit
+    assert server.rendezvous_links[service_circuit]["peer_circuit_id"] == client_circuit
+
+
+def test_cleanup_and_destroy_remove_hs_pending_state(latnet_modules, relay_doc_fixture, mock_key_material):
+    relay_mod = latnet_modules["relay"]
+    server = relay_mod.RelayServer(relay_doc_fixture, circuit_idle_seconds=5)
+    now = time.time()
+    intro_circuit = "c-intro-stale"
+    rdv_circuit = "c-rdv-live"
+    peer_circuit = "c-rdv-peer"
+    for cid, role, created in (
+        (intro_circuit, "intro", now - 10),
+        (rdv_circuit, "rendezvous", now - 1),
+        (peer_circuit, "rendezvous", now - 1),
+    ):
+        server.set_circuit_state(
+            cid,
+            {
+                "role": role,
+                "forward_key": mock_key_material["forward_b64"],
+                "reverse_key": mock_key_material["reverse_b64"],
+                "streams": {},
+                "lifecycle_state": "ready",
+                "created_at": created,
+                "last_activity_at": created,
+            },
+        )
+    server.pending_introductions["cookie-stale"] = {
+        "intro_circuit_id": intro_circuit,
+        "created_at": now - 10,
+        "last_activity_at": now - 10,
+    }
+    server.pending_rendezvous["cookie-live"] = {
+        "created_at": now - 1,
+        "last_activity_at": now - 1,
+        "client_circuit_id": rdv_circuit,
+        "service_circuit_id": peer_circuit,
+        "joined": True,
+        "relay_map": {
+            "client": {"circuit_id": rdv_circuit, "peer_circuit_id": peer_circuit},
+            "service": {"circuit_id": peer_circuit, "peer_circuit_id": rdv_circuit},
+        },
+    }
+    server.rendezvous_links[rdv_circuit] = {"cookie": "cookie-live", "peer_circuit_id": peer_circuit}
+    server.rendezvous_links[peer_circuit] = {"cookie": "cookie-live", "peer_circuit_id": rdv_circuit}
+
+    server.cleanup_stale_state(now=now)
+    assert "cookie-stale" not in server.pending_introductions
+    assert "cookie-live" in server.pending_rendezvous
+
+    destroy_response = server.handle_destroy({"type": "DESTROY", "circuit_id": rdv_circuit})
+    assert destroy_response == {"ok": True, "status": "destroyed"}
+    assert "cookie-live" not in server.pending_rendezvous
+    assert rdv_circuit not in server.rendezvous_links
+    assert peer_circuit not in server.rendezvous_links
