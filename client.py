@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
@@ -12,6 +13,10 @@ from .models.hidden_service import parse_lettuce_name
 from .models.hidden_service_descriptor import verify_hidden_service_descriptor_v2
 from .util import atomic_write_json, b64d, b64e
 from .wire import recv_msg, send_msg
+
+NO_DESCRIPTOR_ERROR = "no descriptor available for hidden service"
+EXPIRED_DESCRIPTOR_ERROR = "hidden service descriptor is expired"
+NO_REACHABLE_INTRO_POINTS_ERROR = "all introduction points are expired or unreachable"
 
 
 @dataclass
@@ -69,14 +74,74 @@ def fetch_hidden_service_descriptor_from_directory(host: str, service_name: str,
     if not isinstance(response, dict):
         raise ValueError("directory response must be an object")
     if not response.get("ok"):
-        raise ValueError(response.get("error", "directory returned error"))
+        error = response.get("error", "directory returned error")
+        if isinstance(error, str) and "hidden service descriptor not found" in error:
+            raise ValueError(NO_DESCRIPTOR_ERROR)
+        raise ValueError(error)
     descriptor = response.get("descriptor")
     if not isinstance(descriptor, dict):
-        raise ValueError("directory response missing descriptor")
+        raise ValueError(NO_DESCRIPTOR_ERROR)
     parsed = verify_hidden_service_descriptor_v2(descriptor)
     if parsed.service_name != service_name:
         raise ValueError("directory returned descriptor for unexpected service name")
+    now = int(time.time())
+    if parsed.valid_until <= now:
+        raise ValueError(EXPIRED_DESCRIPTOR_ERROR)
+    order_intro_points_for_phase1(descriptor, now=now)
     return descriptor
+
+
+def order_intro_points_for_phase1(descriptor: dict[str, Any], *, now: int | None = None) -> list[dict[str, Any]]:
+    if not isinstance(descriptor, dict):
+        raise ValueError(NO_DESCRIPTOR_ERROR)
+
+    now = int(time.time()) if now is None else int(now)
+    parsed = verify_hidden_service_descriptor_v2(descriptor, now=now)
+    if parsed.valid_until <= now:
+        raise ValueError(EXPIRED_DESCRIPTOR_ERROR)
+
+    signed = descriptor.get("signed")
+    if not isinstance(signed, dict):
+        raise ValueError(NO_DESCRIPTOR_ERROR)
+    points = signed.get("introduction_points")
+    if not isinstance(points, list) or not points:
+        raise ValueError(NO_REACHABLE_INTRO_POINTS_ERROR)
+
+    reachable: list[dict[str, Any]] = []
+    for point in points:
+        if not isinstance(point, dict):
+            continue
+        relay_addr = point.get("relay_addr")
+        if not isinstance(relay_addr, dict):
+            continue
+        host = relay_addr.get("host")
+        port = relay_addr.get("port")
+        expires_at = point.get("expires_at")
+        if not isinstance(host, str) or not host:
+            continue
+        if not isinstance(port, int) or port <= 0:
+            continue
+        if not isinstance(expires_at, int) or expires_at <= now:
+            continue
+        reachable.append(point)
+
+    if not reachable:
+        raise ValueError(NO_REACHABLE_INTRO_POINTS_ERROR)
+
+    preferred = reachable[0]
+    fallbacks = sorted(
+        reachable[1:],
+        key=lambda point: (
+            str(point.get("relay_name", "")),
+            str(point["relay_addr"].get("host", "")),
+            int(point["relay_addr"].get("port", 0)),
+        ),
+    )
+    return [preferred, *fallbacks]
+
+
+def select_intro_point_for_phase1(descriptor: dict[str, Any], *, now: int | None = None) -> dict[str, Any]:
+    return order_intro_points_for_phase1(descriptor, now=now)[0]
 
 
 
@@ -280,6 +345,8 @@ __all__ = [
     "fetch_bundle_from_directory",
     "fetch_bundle_to_file",
     "fetch_hidden_service_descriptor_from_directory",
+    "order_intro_points_for_phase1",
+    "select_intro_point_for_phase1",
     "build_circuit",
     "open_stream",
     "send_stream_data",

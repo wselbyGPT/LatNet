@@ -1,5 +1,48 @@
 from __future__ import annotations
 
+import time
+
+
+def _make_hs_descriptor_doc(latnet_modules, tmp_path, *, valid_until_offset: int = 60, intro_offsets: list[int] | None = None):
+    hs_keys = latnet_modules["hidden_service_keys"]
+    util = latnet_modules["util"]
+
+    now = int(time.time())
+    service = hs_keys.generate_service_master("svc", tmp_path / "service_master.json")
+    desc_signing = hs_keys.generate_descriptor_signing_key()
+    cert = hs_keys.build_descriptor_signing_certificate(
+        service,
+        desc_signing["descriptor_signing_public_key"],
+        valid_for=500,
+        now=now - 10,
+    )
+    intro_offsets = intro_offsets or [60]
+    intro_names = ["relay-z", "relay-a", "relay-b"]
+    signed = {
+        "service_name": service["service_name"],
+        "service_master_public_key": service["service_master_public_key"],
+        "descriptor_signing_public_key": desc_signing["descriptor_signing_public_key"],
+        "descriptor_signing_certificate": cert,
+        "valid_after": now - 5,
+        "valid_until": now + valid_until_offset,
+        "revision": 1,
+        "period": 1,
+        "introduction_points": [
+            {
+                "relay_name": intro_names[idx],
+                "relay_addr": {"host": "127.0.0.1", "port": 9101 + idx},
+                "intro_auth_pub": util.b64e(f"intro-auth-{idx}".encode("utf-8")),
+                "intro_key_id": f"intro-key-{idx}",
+                "expires_at": now + offset,
+            }
+            for idx, offset in enumerate(intro_offsets)
+        ],
+    }
+    payload = util.canonical_bytes(signed)
+    signer = hs_keys.Ed25519PrivateKey.from_private_bytes(util.b64d(desc_signing["descriptor_signing_private_key"]))
+    signature = util.b64e(signer.sign(payload))
+    return {"version": 2, "signed": signed, "sigalg": "ed25519", "signature": signature}
+
 
 def test_build_open_data_end_destroy_flow(monkeypatch, latnet_modules):
     client = latnet_modules["client"]
@@ -91,3 +134,58 @@ def test_send_requires_open_stream(latnet_modules):
         raise AssertionError("expected ValueError")
     except ValueError as exc:
         assert "not open" in str(exc)
+
+
+def test_select_intro_point_prefers_first_then_sorted_fallbacks(latnet_modules, tmp_path):
+    client = latnet_modules["client"]
+    descriptor = _make_hs_descriptor_doc(latnet_modules, tmp_path, intro_offsets=[90, 80, 70])
+
+    ordered = client.order_intro_points_for_phase1(descriptor, now=int(time.time()))
+    selected = client.select_intro_point_for_phase1(descriptor, now=int(time.time()))
+
+    assert selected["relay_name"] == "relay-z"
+    assert [point["relay_name"] for point in ordered] == ["relay-z", "relay-a", "relay-b"]
+
+
+def test_select_intro_point_rejects_expired_descriptor(latnet_modules, tmp_path):
+    client = latnet_modules["client"]
+    descriptor = _make_hs_descriptor_doc(latnet_modules, tmp_path, valid_until_offset=-1, intro_offsets=[30])
+
+    try:
+        client.select_intro_point_for_phase1(descriptor, now=int(time.time()))
+        raise AssertionError("expected ValueError")
+    except ValueError as exc:
+        assert str(exc) == client.EXPIRED_DESCRIPTOR_ERROR
+
+
+def test_select_intro_point_rejects_all_intro_points_expired_or_unreachable(latnet_modules, tmp_path):
+    client = latnet_modules["client"]
+    descriptor = _make_hs_descriptor_doc(latnet_modules, tmp_path, intro_offsets=[-1, -5, -10])
+
+    try:
+        client.order_intro_points_for_phase1(descriptor, now=int(time.time()))
+        raise AssertionError("expected ValueError")
+    except ValueError as exc:
+        assert str(exc) == client.NO_REACHABLE_INTRO_POINTS_ERROR
+
+
+def test_fetch_hidden_service_descriptor_surfaces_no_descriptor_error(monkeypatch, latnet_modules):
+    client = latnet_modules["client"]
+    service_name = "a" * 32 + ".lettuce"
+
+    class _FakeSocket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr("socket.create_connection", lambda *_args, **_kwargs: _FakeSocket())
+    monkeypatch.setattr(client, "send_msg", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(client, "recv_msg", lambda *_args, **_kwargs: {"ok": False, "error": "hidden service descriptor not found: nope"})
+
+    try:
+        client.fetch_hidden_service_descriptor_from_directory("127.0.0.1", service_name)
+        raise AssertionError("expected ValueError")
+    except ValueError as exc:
+        assert str(exc) == client.NO_DESCRIPTOR_ERROR
