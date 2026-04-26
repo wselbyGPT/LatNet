@@ -44,6 +44,7 @@ from .hidden_service_runtime import (
     rendezvous_send,
 )
 from .relay import RelayServer, init_relay_file, run_relay_server
+from .observability import EventEmitter, Metrics
 from .util import atomic_write_json, b64d, b64e, load_json
 
 
@@ -145,6 +146,12 @@ def _runtime_error_output(error: Exception, **extra: Any) -> dict[str, Any]:
     payload = {"ok": False, "error": error_to_dict(error)}
     payload.update(extra)
     return payload
+
+
+def _error_code(error: Exception) -> str:
+    details = error_to_dict(error)
+    return str(details.get("code") or "unknown_error")
+
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="latnet", description="LatNet operational CLI")
@@ -285,18 +292,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.top_cmd == "hs" and args.hs_cmd == "serve":
         service_material = load_service_material(args.service_master, args.descriptor)
         parsed_descriptor = service_material["parsed_descriptor"]
+        emitter = EventEmitter(component="hs.service", service_name=parsed_descriptor.service_name)
+        metrics = Metrics()
         relays = _load_relays(args.relays)
         relays_by_name = {str(relay["name"]): relay for relay in relays}
         intro_circuits = build_intro_circuits(service_material["descriptor"], relays_by_name)
-        _print_json(
-            {
-                "ok": True,
-                "mode": "service",
-                "service_name": parsed_descriptor.service_name,
-                "intro_circuits": len(intro_circuits),
-                "status": "runtime_started",
-            }
-        )
+        emitter.emit("hs.runtime_started", status="ok", mode="service", intro_circuits=len(intro_circuits))
 
         reliability = _reliability_config_from_args(args)
         while True:
@@ -304,19 +305,30 @@ def main(argv: list[str] | None = None) -> int:
             for intro in intro_circuits:
                 try:
                     items = poll_intro_requests(intro["circuit"], config=reliability)
+                    emitter.emit("hs.intro_polled", status="ok", mode="service", poll_count=len(items))
                     for item in items:
                         result = handle_intro_request_with_echo(item, config=reliability)
-                        _print_json({"ok": True, "mode": "service", "event": "intro_request", "result": result})
+                        metrics.record_intro_request()
+                        emitter.emit("hs.intro_request_handled", status="ok", mode="service", result=result)
                         handled += 1
                 except Exception as exc:
-                    _print_json(_runtime_error_output(exc, mode="service", event="intro_poll"))
+                    error_code = _error_code(exc)
+                    metrics.record_relay_failure(error_code)
+                    emitter.emit("hs.error", status="error", mode="service", error_code=error_code, error=error_to_dict(exc))
 
             if args.once:
-                _print_json({"ok": True, "mode": "service", "status": "runtime_stopped", "handled": handled})
+                emitter.emit(
+                    "hs.runtime_stopped",
+                    status="ok",
+                    mode="service",
+                    handled=handled,
+                    metrics=metrics.as_dict(),
+                )
                 return 0
             time.sleep(max(0.01, reliability.poll_interval_s))
 
     if args.top_cmd == "hs" and args.hs_cmd == "connect":
+        metrics = Metrics()
         descriptor = fetch_hidden_service_descriptor_from_directory(
             host=args.host,
             port=args.port,
@@ -336,27 +348,53 @@ def main(argv: list[str] | None = None) -> int:
 
         intro_circuit = build_service_circuit([intro_relay], terminal_cmd="INTRO_READY")
         rendezvous_circuit = build_service_circuit([relay_doc], terminal_cmd="RENDEZVOUS_READY")
+        emitter = EventEmitter(
+            component="hs.client",
+            service_name=args.service_name,
+            circuit_id=rendezvous_circuit.circuit_id,
+            rendezvous_cookie=rendezvous_cookie,
+        )
         from .hidden_service_runtime import _send_circuit_cmd
 
-        intro_reply = _send_circuit_cmd(
-            intro_circuit,
-            {
-                "cmd": "INTRODUCE",
-                "rendezvous_cookie": rendezvous_cookie,
-                "introduction": {
-                    "service_name": args.service_name,
-                    "rendezvous_relay": relay_doc,
+        join_started = time.monotonic()
+        emitter.emit("hs.rdv_join_attempt", status="ok", side="client")
+        try:
+            intro_reply = _send_circuit_cmd(
+                intro_circuit,
+                {
+                    "cmd": "INTRODUCE",
+                    "rendezvous_cookie": rendezvous_cookie,
+                    "introduction": {
+                        "service_name": args.service_name,
+                        "rendezvous_relay": relay_doc,
+                    },
                 },
-            },
-        )
-        establish_reply = _send_circuit_cmd(
-            rendezvous_circuit,
-            {
-                "cmd": "RENDEZVOUS_ESTABLISH",
-                "rendezvous_cookie": rendezvous_cookie,
-                "side": "client",
-            },
-        )
+            )
+            establish_reply = _send_circuit_cmd(
+                rendezvous_circuit,
+                {
+                    "cmd": "RENDEZVOUS_ESTABLISH",
+                    "rendezvous_cookie": rendezvous_cookie,
+                    "side": "client",
+                },
+            )
+        except Exception as exc:
+            join_latency_ms = (time.monotonic() - join_started) * 1000.0
+            error_code = _error_code(exc)
+            metrics.record_join(success=False, latency_ms=join_latency_ms)
+            metrics.record_relay_failure(error_code)
+            emitter.emit(
+                "hs.rdv_joined",
+                status="error",
+                side="client",
+                join_latency_ms=join_latency_ms,
+                error_code=error_code,
+            )
+            emitter.emit("hs.error", status="error", error_code=error_code, error=error_to_dict(exc), metrics=metrics.as_dict())
+            return 1
+        join_latency_ms = (time.monotonic() - join_started) * 1000.0
+        metrics.record_join(success=True, latency_ms=join_latency_ms)
+        emitter.emit("hs.rdv_joined", status="ok", side="client", join_latency_ms=join_latency_ms)
 
         session = {
             "mode": "client",
@@ -366,33 +404,52 @@ def main(argv: list[str] | None = None) -> int:
             "stream_next_seq": {"0": 2},
         }
         _save_hs_session(args.session, session)
-        _print_json(
-            {
-                "ok": True,
-                "session": str(Path(args.session)),
-                "service_name": args.service_name,
-                "rendezvous_cookie": rendezvous_cookie,
-                "intro": intro_reply,
-                "rendezvous": establish_reply,
-            }
+        emitter.emit(
+            "hs.runtime_stopped",
+            status="ok",
+            mode="client",
+            session=str(Path(args.session)),
+            intro=intro_reply,
+            rendezvous=establish_reply,
+            metrics=metrics.as_dict(),
         )
         return 0
 
     if args.top_cmd == "hs" and args.hs_cmd == "send":
+        metrics = Metrics()
         session = _load_hs_session(args.session)
+        emitter = EventEmitter(
+            component="hs.client",
+            service_name=session.get("service_name"),
+            rendezvous_cookie=session.get("rendezvous_cookie"),
+            circuit_id=session.get("circuit", {}).get("circuit_id"),
+        )
         if session.get("ended_at"):
-            _print_json({"ok": False, "error": "session already ended"})
+            emitter.emit("hs.error", status="error", error_code="session_ended", error="session already ended")
             return 1
         circuit = _hs_circuit_from_json(session["circuit"])
-        reply = rendezvous_send(circuit, str(session["rendezvous_cookie"]), args.payload)
+        try:
+            reply = rendezvous_send(circuit, str(session["rendezvous_cookie"]), args.payload)
+        except Exception as exc:
+            error_code = _error_code(exc)
+            metrics.record_relay_failure(error_code)
+            emitter.emit("hs.error", status="error", error_code=error_code, error=error_to_dict(exc), metrics=metrics.as_dict())
+            return 1
         _save_hs_session(args.session, session)
-        _print_json(reply)
+        emitter.emit("hs.message_sent", status="ok", command_reply=reply, metrics=metrics.as_dict())
         return 0
 
     if args.top_cmd == "hs" and args.hs_cmd == "recv":
+        metrics = Metrics()
         session = _load_hs_session(args.session)
         circuit = _hs_circuit_from_json(session["circuit"])
         cookie = str(session["rendezvous_cookie"])
+        emitter = EventEmitter(
+            component="hs.client",
+            service_name=session.get("service_name"),
+            rendezvous_cookie=cookie,
+            circuit_id=session.get("circuit", {}).get("circuit_id"),
+        )
 
         reliability = ReliabilityConfig(
             join_timeout_s=max(0.0, float(args.timeout)),
@@ -406,75 +463,78 @@ def main(argv: list[str] | None = None) -> int:
             while True:
                 payload = rendezvous_recv(circuit, cookie, config=reliability)
                 if payload is not None:
-                    _print_json(
-                        {
-                            "ok": True,
-                            "service_name": session.get("service_name"),
-                            "rendezvous_cookie": cookie,
-                            "payload": payload,
-                            "received_at": int(time.time()),
-                        }
-                    )
+                    emitter.emit("hs.message_received", status="ok", payload=payload, received_at=int(time.time()))
                     return 0
                 if not args.follow or time.monotonic() >= deadline:
-                    _print_json(
-                        _runtime_error_output(
-                            HiddenServiceRuntimeError("timeout waiting for rendezvous payload"),
-                            service_name=session.get("service_name"),
-                            rendezvous_cookie=cookie,
-                            payload=None,
-                            received_at=int(time.time()),
-                        )
+                    timeout_error = HiddenServiceRuntimeError("timeout waiting for rendezvous payload")
+                    error_code = _error_code(timeout_error)
+                    metrics.record_relay_failure(error_code)
+                    emitter.emit(
+                        "hs.error",
+                        status="error",
+                        error_code=error_code,
+                        error=error_to_dict(timeout_error),
+                        payload=None,
+                        received_at=int(time.time()),
+                        metrics=metrics.as_dict(),
                     )
                     return 1
                 time.sleep(reliability.poll_interval_s)
         except HiddenServiceRuntimeError as exc:
-            _print_json(
-                _runtime_error_output(
-                    exc,
-                    service_name=session.get("service_name"),
-                    rendezvous_cookie=cookie,
-                    payload=None,
-                    received_at=int(time.time()),
-                )
+            error_code = _error_code(exc)
+            metrics.record_relay_failure(error_code)
+            emitter.emit(
+                "hs.error",
+                status="error",
+                error_code=error_code,
+                error=error_to_dict(exc),
+                payload=None,
+                received_at=int(time.time()),
+                metrics=metrics.as_dict(),
             )
             return 1
         except Exception as exc:
-            _print_json(
-                _runtime_error_output(
-                    exc,
-                    service_name=session.get("service_name"),
-                    rendezvous_cookie=cookie,
-                    payload=None,
-                    received_at=int(time.time()),
-                )
+            error_code = _error_code(exc)
+            metrics.record_relay_failure(error_code)
+            emitter.emit(
+                "hs.error",
+                status="error",
+                error_code=error_code,
+                error=error_to_dict(exc),
+                payload=None,
+                received_at=int(time.time()),
+                metrics=metrics.as_dict(),
             )
             return 1
         except KeyboardInterrupt:
-            _print_json(
-                {
-                    "ok": False,
-                    "service_name": session.get("service_name"),
-                    "rendezvous_cookie": cookie,
-                    "payload": None,
-                    "received_at": int(time.time()),
-                    "error": "interrupted",
-                }
-            )
+            emitter.emit("hs.error", status="error", error_code="interrupted", payload=None, received_at=int(time.time()))
             return 130
 
     if args.top_cmd == "hs" and args.hs_cmd == "end":
+        metrics = Metrics()
         session = _load_hs_session(args.session)
+        emitter = EventEmitter(
+            component="hs.client",
+            service_name=session.get("service_name"),
+            rendezvous_cookie=session.get("rendezvous_cookie"),
+            circuit_id=session.get("circuit", {}).get("circuit_id"),
+        )
         if session.get("ended_at"):
-            _print_json({"ok": False, "error": "session already ended"})
+            emitter.emit("hs.error", status="error", error_code="session_ended", error="session already ended")
             return 1
         circuit = _hs_circuit_from_json(session["circuit"])
-        reply = rendezvous_close(circuit, str(session["rendezvous_cookie"]), args.payload)
+        try:
+            reply = rendezvous_close(circuit, str(session["rendezvous_cookie"]), args.payload)
+        except Exception as exc:
+            error_code = _error_code(exc)
+            metrics.record_relay_failure(error_code)
+            emitter.emit("hs.error", status="error", error_code=error_code, error=error_to_dict(exc), metrics=metrics.as_dict())
+            return 1
         session["ended_at"] = int(time.time())
         session["end_reason"] = "user_end"
         session["final_payload"] = args.payload
         _save_hs_session(args.session, session)
-        _print_json(reply)
+        emitter.emit("hs.runtime_stopped", status="ok", mode="client", command_reply=reply, metrics=metrics.as_dict())
         return 0
 
     if args.top_cmd == "hs" and args.hs_cmd == "publish":
