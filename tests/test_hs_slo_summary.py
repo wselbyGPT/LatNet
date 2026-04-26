@@ -70,3 +70,52 @@ def test_hs_slo_summary_text_output_from_stdin() -> None:
     assert "rdv_join_success_rate: 100.00%" in completed.stdout
     assert "rdv_join_latency_p95_ms: 123.00" in completed.stdout
     assert "timeout: 1" in completed.stdout
+    assert "alert_status: ok" in completed.stdout
+
+
+def test_hs_slo_summary_alert_rule_breaches(tmp_path: Path) -> None:
+    events_path = tmp_path / "alerts.jsonl"
+    events_path.write_text(
+        "\n".join(
+            [
+                json.dumps({"event": "hs.rdv_joined", "status": "error", "ts": "2026-04-26T12:00:00Z", "service_name": "svc-a"}),
+                json.dumps({"event": "hs.rdv_joined", "status": "error", "ts": "2026-04-26T12:00:30Z", "service_name": "svc-a"}),
+                json.dumps({"event": "hs.rdv_joined", "status": "error", "ts": "2026-04-26T12:01:00Z", "service_name": "svc-a"}),
+                json.dumps({"event": "hs.rdv_joined", "status": "ok", "ts": "2026-04-26T12:01:30Z", "service_name": "svc-a"}),
+                json.dumps({"event": "hs.error", "status": "error", "error_code": "intro_poll", "ts": "2026-04-26T12:02:00Z", "service_name": "svc-a"}),
+                json.dumps({"event": "hs.error", "status": "error", "error_code": "intro_poll", "ts": "2026-04-26T12:02:20Z", "service_name": "svc-a"}),
+                json.dumps({"event": "hs.error", "status": "error", "error_code": "intro_poll", "ts": "2026-04-26T12:02:40Z", "service_name": "svc-a"}),
+                json.dumps({"event": "hs.intro_polled", "status": "error", "ts": "2026-04-26T12:03:00Z", "service_name": "svc-a"}),
+                json.dumps({"event": "hs.intro_polled", "status": "ok", "ts": "2026-04-26T12:03:10Z", "service_name": "svc-a"}),
+                json.dumps({"event": "hs.error", "status": "error", "error_code": "timeout", "ts": "2026-04-26T12:04:00Z", "service_name": "svc-a"}),
+                json.dumps({"event": "hs.error", "status": "error", "error_code": "timeout", "ts": "2026-04-26T12:04:10Z", "service_name": "svc-a"}),
+                json.dumps({"event": "hs.error", "status": "error", "error_code": "timeout", "ts": "2026-04-26T12:04:20Z", "service_name": "svc-a"}),
+                json.dumps({"event": "hs.error", "status": "error", "error_code": "timeout", "ts": "2026-04-26T12:04:30Z", "service_name": "svc-a"}),
+                json.dumps({"event": "hs.error", "status": "error", "error_code": "timeout", "ts": "2026-04-26T12:04:40Z", "service_name": "svc-a"}),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "scripts/hs_slo_summary.py",
+            "--events",
+            str(events_path),
+            "--contract",
+            "docs/hs_slo_contract.json",
+            "--format",
+            "json",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    summary = json.loads(completed.stdout)
+    assert summary["alert_evaluation"]["status"] == "critical"
+    assert "join_failure_rate_critical_5m" in summary["alert_evaluation"]["breached_rules"]
+    assert "intro_poll_failures_consecutive_critical" in summary["alert_evaluation"]["breached_rules"]
+    assert "timeout_errors_repeated_warning_10m" in summary["alert_evaluation"]["breached_rules"]
