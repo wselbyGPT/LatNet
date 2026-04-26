@@ -87,3 +87,38 @@ def test_cli_hs_connect_send_end_session_roundtrip(tmp_path, latnet_modules, mon
     assert "ended_at" in saved
     out = capsys.readouterr().out
     assert "RENDEZVOUS_RELAYED" in out
+
+
+def test_cli_hs_publish_invokes_client_helper(tmp_path, latnet_modules, monkeypatch, capsys):
+    cli = latnet_modules["cli"]
+
+    service = tmp_path / "service.json"
+    descriptor = tmp_path / "descriptor.json"
+    service_name = "abcdabcdabcdabcdabcdabcdabcdabcd.lettuce"
+    service.write_text(json.dumps({"service_name": service_name}), encoding="utf-8")
+    descriptor.write_text(json.dumps({"version": 2}), encoding="utf-8")
+
+    monkeypatch.setattr(
+        cli,
+        "publish_hidden_service_descriptor_to_directory",
+        lambda **kwargs: {"ok": True, "service_name": kwargs["service_name"], "accepted_revision": 2},
+    )
+
+    rc = cli.main(
+        [
+            "hs",
+            "publish",
+            "--service-master",
+            str(service),
+            "--descriptor",
+            str(descriptor),
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "9200",
+            "--expected-revision",
+            "1",
+        ]
+    )
+    assert rc == 0
+    assert '"accepted_revision": 2' in capsys.readouterr().out

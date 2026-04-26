@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import socket
+import time
 from pathlib import Path
 from typing import Any
 
 from .models.hidden_service import parse_lettuce_name
 from .models.hidden_service_descriptor import verify_hidden_service_descriptor_v2
-from .models.protocol import parse_get_bundle_request, parse_get_hidden_service_descriptor_request
-from .util import load_json
+from .models.protocol import (
+    parse_get_bundle_request,
+    parse_get_hidden_service_descriptor_request,
+    parse_publish_hidden_service_descriptor_request,
+)
+from .util import atomic_write_json, load_json
 from . import wire
 
 
@@ -21,19 +26,39 @@ class DirectoryServer:
 
     def hidden_service_store(self) -> dict[str, Any]:
         if self.hidden_service_store_path is None:
-            return {"version": 1, "descriptors": []}
+            return {"version": 2, "descriptors": {}}
         return load_json(self.hidden_service_store_path)
 
     def current_hidden_service_descriptors(self) -> dict[str, Any]:
         store = self.hidden_service_store()
         descriptors = store.get("descriptors")
-        if not isinstance(descriptors, list):
-            raise ValueError("hidden service descriptor store must include descriptors list")
-        out: dict[str, Any] = {}
-        for descriptor in descriptors:
-            parsed = verify_hidden_service_descriptor_v2(descriptor)
-            out[parsed.service_name] = descriptor
-        return out
+        if isinstance(descriptors, dict):
+            out: dict[str, Any] = {}
+            for service_name, descriptor in descriptors.items():
+                parse_lettuce_name(str(service_name))
+                parsed = verify_hidden_service_descriptor_v2(descriptor)
+                if parsed.service_name != service_name:
+                    raise ValueError("descriptor service_name does not match hidden service store key")
+                out[parsed.service_name] = descriptor
+            return out
+        if isinstance(descriptors, list):
+            out = {}
+            for descriptor in descriptors:
+                parsed = verify_hidden_service_descriptor_v2(descriptor)
+                out[parsed.service_name] = descriptor
+            return out
+        raise ValueError("hidden service descriptor store must include descriptors dict or list")
+
+    def _write_hidden_service_descriptors(self, descriptors_by_name: dict[str, Any]) -> None:
+        if self.hidden_service_store_path is None:
+            raise ValueError("hidden service descriptor publishing disabled")
+        atomic_write_json(
+            self.hidden_service_store_path,
+            {
+                "version": 2,
+                "descriptors": dict(sorted(descriptors_by_name.items())),
+            },
+        )
 
     def handle_conn(self, conn: socket.socket) -> None:
         try:
@@ -49,6 +74,109 @@ class DirectoryServer:
                     wire.send_msg(conn, {"ok": False, "error": f"hidden service descriptor not found: {service_name}"})
                 else:
                     wire.send_msg(conn, {"ok": True, "service_name": service_name, "descriptor": descriptor})
+            elif msg.get("type") == "PUBLISH_HS_DESCRIPTOR":
+                request = parse_publish_hidden_service_descriptor_request(msg)
+                now = int(time.time())
+                parse_lettuce_name(request.service_name)
+                service_name = request.service_name
+                if self.hidden_service_store_path is None:
+                    wire.send_msg(
+                        conn,
+                        {
+                            "ok": False,
+                            "error_class": "unauthorized",
+                            "error": "hidden service descriptor publishing disabled",
+                            "service_name": service_name,
+                            "idempotency_key": request.idempotency_key,
+                        },
+                    )
+                    return
+                try:
+                    parsed = verify_hidden_service_descriptor_v2(request.descriptor, now=now)
+                except Exception as exc:
+                    wire.send_msg(
+                        conn,
+                        {
+                            "ok": False,
+                            "error_class": "invalid_signature",
+                            "error": str(exc),
+                            "service_name": service_name,
+                            "idempotency_key": request.idempotency_key,
+                        },
+                    )
+                    return
+                if parsed.service_name != service_name:
+                    wire.send_msg(
+                        conn,
+                        {
+                            "ok": False,
+                            "error_class": "invalid_signature",
+                            "error": "descriptor service_name does not match request service_name",
+                            "service_name": service_name,
+                            "idempotency_key": request.idempotency_key,
+                        },
+                    )
+                    return
+                if parsed.valid_until <= now:
+                    wire.send_msg(
+                        conn,
+                        {
+                            "ok": False,
+                            "error_class": "expired_descriptor",
+                            "error": "hidden service descriptor is expired",
+                            "service_name": service_name,
+                            "idempotency_key": request.idempotency_key,
+                        },
+                    )
+                    return
+                descriptors_by_name = self.current_hidden_service_descriptors()
+                existing = descriptors_by_name.get(service_name)
+                current_revision = None
+                if isinstance(existing, dict):
+                    current_revision = verify_hidden_service_descriptor_v2(existing, now=now).revision
+
+                if request.expected_previous_revision is not None and request.expected_previous_revision != current_revision:
+                    wire.send_msg(
+                        conn,
+                        {
+                            "ok": False,
+                            "error_class": "revision_conflict",
+                            "error": "expected_previous_revision does not match current revision",
+                            "service_name": service_name,
+                            "expected_previous_revision": request.expected_previous_revision,
+                            "current_revision": current_revision,
+                            "idempotency_key": request.idempotency_key,
+                        },
+                    )
+                    return
+
+                if current_revision is not None and parsed.revision <= current_revision:
+                    wire.send_msg(
+                        conn,
+                        {
+                            "ok": False,
+                            "error_class": "revision_conflict",
+                            "error": "descriptor revision must be strictly increasing",
+                            "service_name": service_name,
+                            "current_revision": current_revision,
+                            "candidate_revision": parsed.revision,
+                            "idempotency_key": request.idempotency_key,
+                        },
+                    )
+                    return
+
+                descriptors_by_name[service_name] = request.descriptor
+                self._write_hidden_service_descriptors(descriptors_by_name)
+                wire.send_msg(
+                    conn,
+                    {
+                        "ok": True,
+                        "service_name": service_name,
+                        "accepted_revision": parsed.revision,
+                        "expected_previous_revision": request.expected_previous_revision,
+                        "idempotency_key": request.idempotency_key,
+                    },
+                )
             else:
                 wire.send_msg(conn, {"ok": False, "error": f"unknown message type {msg.get('type')}"})
         except Exception as exc:
