@@ -1,5 +1,5 @@
 {
-  "contract_version": "1.0.0",
+  "contract_version": "1.1.0",
   "description": "Hidden-service SLO contract for deriving join/reliability counters and ratios from JSONL observability events.",
   "source_event_schema_refs": [
     "docs/protocol_notes.md",
@@ -64,6 +64,56 @@
     "timeout_error_rate_over_errors": {
       "formula": "timeout_error_total / max(1, rdv_join_failure_total)",
       "description": "Timeout-tagged errors as a fraction of join failures (bounded denominator)."
+    }
+  },
+  "alert_rules": {
+    "join_failure_rate_warning_10m": {
+      "description": "Warning if rendezvous join failure rate is above 5% over 10 minutes.",
+      "severity": "warning",
+      "window_minutes": 10,
+      "metric": "rdv_join_failure_rate",
+      "operator": ">",
+      "threshold": 0.05
+    },
+    "join_failure_rate_critical_5m": {
+      "description": "Critical if rendezvous join failure rate is above 10% over 5 minutes.",
+      "severity": "critical",
+      "window_minutes": 5,
+      "metric": "rdv_join_failure_rate",
+      "operator": ">",
+      "threshold": 0.1
+    },
+    "intro_poll_failures_consecutive_critical": {
+      "description": "Critical if one service emits 3 or more consecutive intro-poll failures.",
+      "severity": "critical",
+      "window_minutes": 15,
+      "metric": "intro_poll_failures_consecutive_max",
+      "operator": ">=",
+      "threshold": 3
+    },
+    "intro_poll_failure_rate_warning_15m": {
+      "description": "Warning if intro-poll failures exceed 2% of intro polls over 15 minutes.",
+      "severity": "warning",
+      "window_minutes": 15,
+      "metric": "intro_poll_failure_rate",
+      "operator": ">",
+      "threshold": 0.02
+    },
+    "timeout_errors_repeated_warning_10m": {
+      "description": "Warning if timeout errors for one service occur 5 or more times in 10 minutes.",
+      "severity": "warning",
+      "window_minutes": 10,
+      "metric": "timeout_error_count_max_per_service",
+      "operator": ">=",
+      "threshold": 5
+    },
+    "timeout_errors_repeated_critical_10m": {
+      "description": "Critical if timeout errors for one service occur 10 or more times in 10 minutes.",
+      "severity": "critical",
+      "window_minutes": 10,
+      "metric": "timeout_error_count_max_per_service",
+      "operator": ">=",
+      "threshold": 10
     }
   },
   "compatibility": {

@@ -34,6 +34,7 @@ import json
 import math
 import sys
 from collections import Counter
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -76,7 +77,46 @@ def _p95(samples: list[float]) -> float | None:
     return values[rank - 1]
 
 
+def _parse_ts(raw_ts: Any) -> datetime | None:
+    if not isinstance(raw_ts, str) or not raw_ts:
+        return None
+
+    value = raw_ts
+    if value.endswith("Z"):
+        value = value[:-1] + "+00:00"
+
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _in_window(event_ts: datetime | None, window_start: datetime | None, window_end: datetime | None) -> bool:
+    if window_start is None or window_end is None:
+        return True
+    if event_ts is None:
+        return False
+    return window_start <= event_ts <= window_end
+
+
+def _compare(actual: float, operator: str, threshold: float) -> bool:
+    if operator == ">":
+        return actual > threshold
+    if operator == ">=":
+        return actual >= threshold
+    if operator == "<":
+        return actual < threshold
+    if operator == "<=":
+        return actual <= threshold
+    raise ValueError(f"Unsupported operator: {operator}")
+
+
 def summarize(events: Iterable[Event], contract: dict[str, Any]) -> dict[str, Any]:
+    events_list = list(events)
     selectors = contract.get("event_selectors", {})
     success_selector = selectors.get("rdv_join_success", {"event": "hs.rdv_joined", "status": "ok"})
     failure_selector = selectors.get("rdv_join_failure", {"event": "hs.rdv_joined", "status": "error"})
@@ -86,7 +126,7 @@ def summarize(events: Iterable[Event], contract: dict[str, Any]) -> dict[str, An
     join_latency_samples: list[float] = []
     timeout_counts: Counter[str] = Counter()
 
-    for event in events:
+    for event in events_list:
         if _matches(event, success_selector):
             success_total += 1
             latency = event.get("join_latency_ms")
@@ -104,7 +144,7 @@ def summarize(events: Iterable[Event], contract: dict[str, Any]) -> dict[str, An
     attempts = success_total + failure_total
     success_rate = None if attempts == 0 else success_total / attempts
 
-    return {
+    summary = {
         "contract_version": contract.get("contract_version"),
         "rdv_join_success_total": success_total,
         "rdv_join_failure_total": failure_total,
@@ -113,6 +153,98 @@ def summarize(events: Iterable[Event], contract: dict[str, Any]) -> dict[str, An
         "rdv_join_latency_samples": len(join_latency_samples),
         "timeout_counts_by_error_code": dict(sorted(timeout_counts.items())),
     }
+    summary["alert_evaluation"] = _evaluate_alert_rules(events_list, contract)
+    return summary
+
+
+def _evaluate_alert_rules(events: list[Event], contract: dict[str, Any]) -> dict[str, Any]:
+    alert_rules: dict[str, dict[str, Any]] = contract.get("alert_rules", {})
+    if not alert_rules:
+        return {"status": "ok", "breached_rules": [], "rule_statuses": {}}
+
+    parsed_events: list[tuple[Event, datetime | None]] = [(event, _parse_ts(event.get("ts"))) for event in events]
+    known_ts = [parsed for _, parsed in parsed_events if parsed is not None]
+    window_end = max(known_ts) if known_ts else None
+
+    rule_statuses: dict[str, str] = {}
+    breached_rules: list[str] = []
+
+    for rule_name, rule in alert_rules.items():
+        window_minutes = int(rule.get("window_minutes", 0))
+        window_start = None if window_end is None else window_end - timedelta(minutes=window_minutes)
+        metric = str(rule.get("metric"))
+        operator = str(rule.get("operator", ">"))
+        threshold = float(rule.get("threshold", 0))
+
+        metric_value = _metric_value(metric, parsed_events, window_start, window_end)
+        breached = _compare(metric_value, operator, threshold)
+        if breached:
+            severity = str(rule.get("severity", "warning"))
+            rule_statuses[rule_name] = severity
+            breached_rules.append(rule_name)
+        else:
+            rule_statuses[rule_name] = "ok"
+
+    overall_status = "ok"
+    if any(status == "critical" for status in rule_statuses.values()):
+        overall_status = "critical"
+    elif any(status == "warning" for status in rule_statuses.values()):
+        overall_status = "warning"
+
+    return {
+        "status": overall_status,
+        "breached_rules": sorted(breached_rules),
+        "rule_statuses": dict(sorted(rule_statuses.items())),
+    }
+
+
+def _metric_value(
+    metric: str,
+    events: list[tuple[Event, datetime | None]],
+    window_start: datetime | None,
+    window_end: datetime | None,
+) -> float:
+    window_events = [event for event, ts in events if _in_window(ts, window_start, window_end)]
+
+    if metric == "rdv_join_failure_rate":
+        success = sum(1 for event in window_events if event.get("event") == "hs.rdv_joined" and event.get("status") == "ok")
+        failure = sum(1 for event in window_events if event.get("event") == "hs.rdv_joined" and event.get("status") == "error")
+        attempts = success + failure
+        return 0.0 if attempts == 0 else failure / attempts
+
+    if metric == "intro_poll_failures_consecutive_max":
+        max_streak_by_service: dict[str, int] = {}
+        streak_by_service: dict[str, int] = {}
+        ordered = sorted(events, key=lambda item: item[1] or datetime.min.replace(tzinfo=timezone.utc))
+        for event, ts in ordered:
+            if not _in_window(ts, window_start, window_end):
+                continue
+            service = str(event.get("service_name", "unknown"))
+            if event.get("event") == "hs.error" and event.get("status") == "error" and event.get("error_code") == "intro_poll":
+                streak_by_service[service] = streak_by_service.get(service, 0) + 1
+                max_streak_by_service[service] = max(max_streak_by_service.get(service, 0), streak_by_service[service])
+            elif event.get("event") == "hs.intro_polled" and event.get("status") == "ok":
+                streak_by_service[service] = 0
+        return float(max(max_streak_by_service.values(), default=0))
+
+    if metric == "intro_poll_failure_rate":
+        failures = sum(
+            1
+            for event in window_events
+            if event.get("event") == "hs.error" and event.get("status") == "error" and event.get("error_code") == "intro_poll"
+        )
+        polls = sum(1 for event in window_events if event.get("event") == "hs.intro_polled")
+        return 0.0 if polls == 0 else failures / polls
+
+    if metric == "timeout_error_count_max_per_service":
+        counter: Counter[str] = Counter()
+        for event in window_events:
+            if event.get("event") == "hs.error" and event.get("status") == "error" and event.get("error_code") == "timeout":
+                service = str(event.get("service_name", "unknown"))
+                counter[service] += 1
+        return float(max(counter.values(), default=0))
+
+    raise ValueError(f"Unsupported alert metric: {metric}")
 
 
 def _format_text(summary: dict[str, Any]) -> str:
@@ -136,6 +268,16 @@ def _format_text(summary: dict[str, Any]) -> str:
     if timeout_counts:
         for error_code, count in timeout_counts.items():
             lines.append(f"  - {error_code}: {count}")
+    else:
+        lines.append("  - (none)")
+
+    alert_eval = summary.get("alert_evaluation", {})
+    lines.append(f"alert_status: {alert_eval.get('status', 'ok')}")
+    lines.append("breached_rules:")
+    breached_rules = alert_eval.get("breached_rules", [])
+    if breached_rules:
+        for rule in breached_rules:
+            lines.append(f"  - {rule}")
     else:
         lines.append("  - (none)")
 

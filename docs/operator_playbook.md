@@ -194,13 +194,25 @@ LatNet hidden-service CLI emits JSON events with envelope fields:
 | `hs.runtime_stopped` | envelope + `mode`, `metrics` | Graceful stop/summary. |
 | `hs.error` | envelope + `error_code`, `error` | Error surface for alerting. |
 
-### Suggested alert thresholds
+### Alert rule semantics (source-of-truth: SLO contract)
 
-Starting thresholds (adjust to your baseline volume):
+Alert definitions are versioned in `docs/hs_slo_contract.json` under `alert_rules`; treat that file as source of truth for automation and CI checks.
 
-- **Rendezvous join failure rate**: alert at `>5%` over 10 minutes (warning) and `>10%` over 5 minutes (critical).
-- **Intro poll failures** (`hs.error` during intro polling): alert when `>=3` consecutive failures on one instance or `>2%` failed polls fleet-wide over 15 minutes.
-- **Repeated receive/join timeouts**: alert when same `error_code` timeout appears `>=5` times in 10 minutes per service.
+- **Join failure windows**
+  - `join_failure_rate_warning_10m`: warning when `rdv_join_failure_rate > 0.05` in 10 minutes.
+  - `join_failure_rate_critical_5m`: critical when `rdv_join_failure_rate > 0.10` in 5 minutes.
+- **Intro poll failures**
+  - `intro_poll_failures_consecutive_critical`: critical when one service reaches `>=3` consecutive `intro_poll` errors.
+  - `intro_poll_failure_rate_warning_15m`: warning when intro-poll failures exceed `2%` of `hs.intro_polled` events in 15 minutes.
+- **Repeated timeout errors per service**
+  - `timeout_errors_repeated_warning_10m`: warning when one service logs `>=5` timeout errors in 10 minutes.
+  - `timeout_errors_repeated_critical_10m`: critical when one service logs `>=10` timeout errors in 10 minutes.
+
+The summarizer (`scripts/hs_slo_summary.py`) evaluates these contract rules and returns:
+
+- `alert_evaluation.status`: overall `ok` / `warning` / `critical`.
+- `alert_evaluation.rule_statuses`: status per rule name.
+- `alert_evaluation.breached_rules`: breached rule-name list.
 
 ## Operational quick reference commands
 
