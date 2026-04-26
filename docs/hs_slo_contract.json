@@ -1,0 +1,74 @@
+{
+  "contract_version": "1.0.0",
+  "description": "Hidden-service SLO contract for deriving join/reliability counters and ratios from JSONL observability events.",
+  "source_event_schema_refs": [
+    "docs/protocol_notes.md",
+    "docs/operator_playbook.md"
+  ],
+  "event_envelope": {
+    "required_fields": ["event", "status"],
+    "optional_fields": ["error_code", "metrics", "join_latency_ms"],
+    "field_name_note": "Selectors and derivations in this contract MUST use emitted JSONL field names exactly: event, status, error_code, metrics, join_latency_ms."
+  },
+  "event_selectors": {
+    "rdv_join_success": {
+      "event": "hs.rdv_joined",
+      "status": "ok"
+    },
+    "rdv_join_failure": {
+      "event": "hs.rdv_joined",
+      "status": "error"
+    },
+    "timeout_error": {
+      "event": "hs.error",
+      "status": "error",
+      "error_code": "timeout"
+    }
+  },
+  "derived_counters": {
+    "rdv_join_success_total": {
+      "selector": "rdv_join_success",
+      "description": "Count of successful rendezvous joins."
+    },
+    "rdv_join_failure_total": {
+      "selector": "rdv_join_failure",
+      "description": "Count of failed rendezvous joins."
+    },
+    "timeout_error_total": {
+      "selector": "timeout_error",
+      "description": "Count of timeout-class hs.error events."
+    }
+  },
+  "histogram_inputs": {
+    "hs.rdv_joined.join_latency_ms": {
+      "event": "hs.rdv_joined",
+      "field": "join_latency_ms",
+      "unit": "milliseconds",
+      "filters": {
+        "status": "ok"
+      },
+      "description": "Latency distribution for successful rendezvous joins."
+    }
+  },
+  "computed_ratios": {
+    "rdv_join_success_rate": {
+      "formula": "rdv_join_success_total / (rdv_join_success_total + rdv_join_failure_total)",
+      "zero_denominator_behavior": "null",
+      "description": "Share of join attempts that end in status=ok."
+    },
+    "rdv_join_failure_rate": {
+      "formula": "rdv_join_failure_total / (rdv_join_success_total + rdv_join_failure_total)",
+      "zero_denominator_behavior": "null",
+      "description": "Share of join attempts that end in status=error."
+    },
+    "timeout_error_rate_over_errors": {
+      "formula": "timeout_error_total / max(1, rdv_join_failure_total)",
+      "description": "Timeout-tagged errors as a fraction of join failures (bounded denominator)."
+    }
+  },
+  "compatibility": {
+    "event_addition_policy": "Forward-compatible with additive event fields and new event names: unknown fields/events MUST be ignored unless explicitly referenced by selectors.",
+    "breaking_change_policy": "Any rename/removal of event, status, error_code, metrics, or join_latency_ms requires a contract_version major bump.",
+    "recommended_migration": "Add new selectors/counters/ratios for new events first, then increment minor version when existing behavior is unchanged."
+  }
+}
