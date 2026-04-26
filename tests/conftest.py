@@ -146,6 +146,7 @@ def latnet_modules():
     directory = _load_module("latnet.directory", REPO_ROOT / "directory.py")
     client = _load_module("latnet.client", REPO_ROOT / "client.py")
     relay = _load_module("latnet.relay", REPO_ROOT / "relay.py")
+    observability = _load_module("latnet.observability", REPO_ROOT / "observability.py")
     cli = _load_module("latnet.cli", REPO_ROOT / "cli.py")
     hidden_service_runtime = _load_module("latnet.hidden_service_runtime", REPO_ROOT / "hidden_service_runtime.py")
     hidden_service_keys = _load_module("latnet.hidden_service_keys", REPO_ROOT / "hidden_service_keys.py")
@@ -163,6 +164,7 @@ def latnet_modules():
         "directory": directory,
         "client": client,
         "relay": relay,
+        "observability": observability,
         "cli": cli,
         "hidden_service_runtime": hidden_service_runtime,
         "models": models,
