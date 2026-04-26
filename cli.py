@@ -16,6 +16,7 @@ from .authority import (
 from .client import (
     CircuitSession,
     HopSession,
+    NO_DESCRIPTOR_ERROR,
     build_circuit,
     destroy_circuit,
     end_stream,
@@ -27,6 +28,7 @@ from .client import (
     send_stream_data,
     select_intro_point_for_phase1,
 )
+from .models.hidden_service_descriptor import verify_hidden_service_descriptor_v2
 from .directory import run_directory_server
 from .hidden_service_runtime import (
     DEFAULT_RELIABILITY_CONFIG,
@@ -236,6 +238,24 @@ def _build_parser() -> argparse.ArgumentParser:
     hs_publish.add_argument("--port", type=int, default=9200, help="Directory port")
     hs_publish.add_argument("--expected-revision", type=int, default=None, help="Expected previous descriptor revision")
     hs_publish.add_argument("--idempotency-key", default=None, help="Optional idempotency key")
+
+    hs_rotate = hs_sub.add_parser("rotate", help="Rotate hidden service descriptor with read-after-write verification")
+    hs_rotate.add_argument("--service-master", required=True, help="Hidden service master key JSON")
+    hs_rotate.add_argument("--descriptor", required=True, help="Hidden service descriptor JSON")
+    hs_rotate.add_argument("--host", default="127.0.0.1", help="Directory host")
+    hs_rotate.add_argument("--port", type=int, default=9200, help="Directory port")
+    hs_rotate.add_argument("--idempotency-key", default=None, help="Optional idempotency key")
+    hs_rotate.add_argument(
+        "--verify-timeout",
+        type=float,
+        default=5.0,
+        help="Timeout in seconds for read-after-write verification",
+    )
+    hs_rotate.add_argument(
+        "--print-rollback-hints",
+        action="store_true",
+        help="Include rollback hints in output",
+    )
 
     return parser
 
@@ -550,6 +570,80 @@ def main(argv: list[str] | None = None) -> int:
             idempotency_key=args.idempotency_key,
         )
         _print_json(response)
+        return 0
+
+    if args.top_cmd == "hs" and args.hs_cmd == "rotate":
+        now = int(time.time())
+        service_master = load_json(args.service_master)
+        descriptor = load_json(args.descriptor)
+        service_name = str(service_master["service_name"])
+
+        proposed = verify_hidden_service_descriptor_v2(descriptor, now=now)
+        if proposed.service_name != service_name:
+            raise ValueError("descriptor service_name does not match service master service_name")
+        if proposed.valid_until <= now:
+            raise ValueError("proposed descriptor is expired")
+
+        current_descriptor: dict[str, Any] | None = None
+        current_revision: int | None = None
+        try:
+            current_descriptor = fetch_hidden_service_descriptor_from_directory(
+                host=args.host,
+                port=args.port,
+                service_name=service_name,
+            )
+            current_revision = verify_hidden_service_descriptor_v2(current_descriptor, now=now).revision
+        except ValueError as exc:
+            if str(exc) != NO_DESCRIPTOR_ERROR:
+                raise
+
+        if current_revision is not None and proposed.revision <= current_revision:
+            raise ValueError(
+                f"proposed descriptor revision must be strictly higher than current revision ({current_revision})"
+            )
+
+        publish_result = publish_hidden_service_descriptor_to_directory(
+            host=args.host,
+            port=args.port,
+            service_name=service_name,
+            descriptor=descriptor,
+            expected_previous_revision=current_revision,
+            idempotency_key=args.idempotency_key,
+        )
+
+        verify_deadline = time.monotonic() + max(0.0, float(args.verify_timeout))
+        visible_revision: int | None = None
+        while True:
+            visible = fetch_hidden_service_descriptor_from_directory(
+                host=args.host,
+                port=args.port,
+                service_name=service_name,
+            )
+            visible_revision = verify_hidden_service_descriptor_v2(visible).revision
+            if visible_revision == proposed.revision:
+                break
+            if time.monotonic() >= verify_deadline:
+                raise TimeoutError(
+                    f"descriptor revision {proposed.revision} not visible before verify timeout; "
+                    f"last visible revision was {visible_revision}"
+                )
+            time.sleep(0.1)
+
+        out: dict[str, Any] = {
+            "ok": True,
+            "rotation_status": "published_and_visible",
+            "service_name": service_name,
+            "accepted_revision": publish_result.get("accepted_revision"),
+            "visible_revision": visible_revision,
+            "expected_previous_revision": current_revision,
+            "idempotency_key": args.idempotency_key,
+        }
+        if args.print_rollback_hints:
+            out["rollback_hints"] = {
+                "previous_revision": current_revision,
+                "recommended_action": "publish a freshly signed descriptor with a higher revision if rollback is needed",
+            }
+        _print_json(out)
         return 0
 
     parser.error("unsupported command")
