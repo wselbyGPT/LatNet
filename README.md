@@ -40,3 +40,18 @@ Operator guidance:
 - Raise `max_retries` and `retry_backoff_max_s` for unstable relay availability.
 - Lower `poll_interval_s` only when you need lower latency and can tolerate higher control traffic.
 - CLI commands `latnet hs serve` and `latnet hs recv` expose retry/backoff knobs for tuning in production.
+
+
+## HS SLO summary utility
+
+Use `scripts/hs_slo_summary.py` to parse newline-delimited JSON observability events with `docs/hs_slo_contract.json` and emit SLO summary metrics.
+
+```bash
+python scripts/hs_slo_summary.py --events artifacts/hs_events_last_24h.jsonl --contract docs/hs_slo_contract.json --format text
+```
+
+CI example (fail build when rendezvous join success rate drops below 99%):
+
+```bash
+python scripts/hs_slo_summary.py --events artifacts/hs_events_last_24h.jsonl --contract docs/hs_slo_contract.json --format json   | python -c 'import json,sys; d=json.load(sys.stdin); s=d["rdv_join_success_rate"] or 0; sys.exit(0 if s>=0.99 else 1)'
+```
