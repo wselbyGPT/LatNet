@@ -214,3 +214,89 @@ def test_service_intro_to_rendezvous_echo_flow(monkeypatch, latnet_modules, tmp_
     finally:
         while started:
             started.pop().stop()
+
+
+def test_establish_service_rendezvous_retries_then_success(monkeypatch, latnet_modules):
+    runtime = latnet_modules["hidden_service_runtime"]
+    circuit = runtime.ServiceCircuit("c1", "127.0.0.1", 1, [b"f"], [b"r"])
+    monkeypatch.setattr(runtime, "build_service_circuit", lambda *_args, **_kwargs: circuit)
+
+    calls = {"n": 0}
+
+    def _fake_send(_circuit, cmd):
+        if cmd["cmd"] == "RENDEZVOUS_ESTABLISH":
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise runtime.RelayUnreachableError("temporary")
+            return {"cmd": "RENDEZVOUS_STATE", "joined": True}
+        raise AssertionError("unexpected command")
+
+    sleeps: list[float] = []
+    monkeypatch.setattr(runtime, "_send_circuit_cmd", _fake_send)
+    monkeypatch.setattr(runtime.time, "sleep", lambda v: sleeps.append(v))
+
+    cfg = runtime.ReliabilityConfig(max_retries=3, retry_backoff_base_s=0.2, retry_backoff_max_s=1.0)
+    built, joined = runtime.establish_service_rendezvous({"name": "r", "host": "h", "port": 1}, "cookie", config=cfg)
+
+    assert built is circuit
+    assert joined is True
+    assert sleeps == [0.2]
+
+
+def test_establish_service_rendezvous_retry_exhaustion(monkeypatch, latnet_modules):
+    runtime = latnet_modules["hidden_service_runtime"]
+    circuit = runtime.ServiceCircuit("c1", "127.0.0.1", 1, [b"f"], [b"r"])
+    monkeypatch.setattr(runtime, "build_service_circuit", lambda *_args, **_kwargs: circuit)
+    monkeypatch.setattr(runtime, "_send_circuit_cmd", lambda *_args, **_kwargs: (_ for _ in ()).throw(runtime.RelayUnreachableError("down")))
+
+    sleeps: list[float] = []
+    monkeypatch.setattr(runtime.time, "sleep", lambda v: sleeps.append(v))
+
+    cfg = runtime.ReliabilityConfig(max_retries=3, retry_backoff_base_s=0.1, retry_backoff_max_s=0.5)
+    with pytest.raises(runtime.RelayUnreachableError):
+        runtime.establish_service_rendezvous({"name": "r", "host": "h", "port": 1}, "cookie", config=cfg)
+
+    assert sleeps == [0.1, 0.2]
+
+
+def test_establish_service_rendezvous_protocol_error_is_fatal(monkeypatch, latnet_modules):
+    runtime = latnet_modules["hidden_service_runtime"]
+    circuit = runtime.ServiceCircuit("c1", "127.0.0.1", 1, [b"f"], [b"r"])
+    monkeypatch.setattr(runtime, "build_service_circuit", lambda *_args, **_kwargs: circuit)
+
+    calls = {"n": 0}
+
+    def _bad(_circuit, cmd):
+        if cmd["cmd"] == "RENDEZVOUS_ESTABLISH":
+            calls["n"] += 1
+            return {"cmd": "WRONG"}
+        raise AssertionError("unexpected")
+
+    monkeypatch.setattr(runtime, "_send_circuit_cmd", _bad)
+    with pytest.raises(runtime.ProtocolMismatchError):
+        runtime.establish_service_rendezvous({"name": "r", "host": "h", "port": 1}, "cookie")
+
+    assert calls["n"] == 1
+
+
+def test_rendezvous_recv_backoff_schedule(monkeypatch, latnet_modules):
+    runtime = latnet_modules["hidden_service_runtime"]
+    circuit = runtime.ServiceCircuit("c1", "127.0.0.1", 1, [b"f"], [b"r"])
+
+    calls = {"n": 0}
+
+    def _recv(_circuit, cmd):
+        calls["n"] += 1
+        if calls["n"] < 4:
+            raise runtime.RelayUnreachableError("flaky")
+        return {"cmd": "RENDEZVOUS_MESSAGE", "payload": "ok"}
+
+    sleeps: list[float] = []
+    monkeypatch.setattr(runtime, "_send_circuit_cmd", _recv)
+    monkeypatch.setattr(runtime.time, "sleep", lambda v: sleeps.append(v))
+
+    cfg = runtime.ReliabilityConfig(max_retries=5, retry_backoff_base_s=0.1, retry_backoff_max_s=0.25)
+    payload = runtime.rendezvous_recv(circuit, "cookie", config=cfg)
+
+    assert payload == "ok"
+    assert sleeps == [0.1, 0.2, 0.25]

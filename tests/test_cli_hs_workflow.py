@@ -192,3 +192,33 @@ def test_cli_hs_publish_invokes_client_helper(tmp_path, latnet_modules, monkeypa
     )
     assert rc == 0
     assert '"accepted_revision": 2' in capsys.readouterr().out
+
+
+def test_cli_hs_recv_outputs_structured_runtime_error(tmp_path, latnet_modules, monkeypatch, capsys):
+    cli = latnet_modules["cli"]
+    runtime = latnet_modules["hidden_service_runtime"]
+    session_path = tmp_path / "hs-session.json"
+    session_path.write_text(
+        json.dumps(
+            {
+                "service_name": "svc.lettuce",
+                "rendezvous_cookie": "cookie-1",
+                "circuit": {
+                    "circuit_id": "c-1",
+                    "guard_host": "127.0.0.1",
+                    "guard_port": 9014,
+                    "forward_keys": ["Zg=="],
+                    "reverse_keys": ["cg=="],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(cli, "rendezvous_recv", lambda *_args, **_kwargs: (_ for _ in ()).throw(runtime.ProtocolMismatchError("bad")))
+
+    rc = cli.main(["hs", "recv", "--session", str(session_path), "--follow", "--timeout", "1"])
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert '"code": "protocol_mismatch"' in out
+    assert '"retriable": false' in out

@@ -29,9 +29,13 @@ from .client import (
 )
 from .directory import run_directory_server
 from .hidden_service_runtime import (
+    DEFAULT_RELIABILITY_CONFIG,
+    HiddenServiceRuntimeError,
+    ReliabilityConfig,
     ServiceCircuit,
     build_intro_circuits,
     build_service_circuit,
+    error_to_dict,
     handle_intro_request_with_echo,
     load_service_material,
     poll_intro_requests,
@@ -125,6 +129,23 @@ def _load_hs_session(path: str) -> dict[str, Any]:
     return load_json(path)
 
 
+
+
+def _reliability_config_from_args(args: argparse.Namespace) -> ReliabilityConfig:
+    return ReliabilityConfig(
+        join_timeout_s=max(0.0, float(getattr(args, "join_timeout", DEFAULT_RELIABILITY_CONFIG.join_timeout_s))),
+        poll_interval_s=max(0.0, float(getattr(args, "poll_interval", DEFAULT_RELIABILITY_CONFIG.poll_interval_s))),
+        max_retries=max(1, int(getattr(args, "max_retries", DEFAULT_RELIABILITY_CONFIG.max_retries))),
+        retry_backoff_base_s=max(0.0, float(getattr(args, "retry_backoff_base", DEFAULT_RELIABILITY_CONFIG.retry_backoff_base_s))),
+        retry_backoff_max_s=max(0.0, float(getattr(args, "retry_backoff_max", DEFAULT_RELIABILITY_CONFIG.retry_backoff_max_s))),
+    )
+
+
+def _runtime_error_output(error: Exception, **extra: Any) -> dict[str, Any]:
+    payload = {"ok": False, "error": error_to_dict(error)}
+    payload.update(extra)
+    return payload
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="latnet", description="LatNet operational CLI")
     subparsers = parser.add_subparsers(dest="top_cmd", required=True)
@@ -171,7 +192,11 @@ def _build_parser() -> argparse.ArgumentParser:
     hs_serve.add_argument("--service-master", required=True, help="Hidden service master key JSON")
     hs_serve.add_argument("--descriptor", required=True, help="Hidden service descriptor JSON")
     hs_serve.add_argument("relays", nargs="+", help="Relay descriptor JSON paths")
-    hs_serve.add_argument("--poll-interval", type=float, default=0.25, help="Poll interval seconds")
+    hs_serve.add_argument("--poll-interval", type=float, default=DEFAULT_RELIABILITY_CONFIG.poll_interval_s, help="Poll interval seconds")
+    hs_serve.add_argument("--join-timeout", type=float, default=DEFAULT_RELIABILITY_CONFIG.join_timeout_s, help="Join timeout seconds")
+    hs_serve.add_argument("--max-retries", type=int, default=DEFAULT_RELIABILITY_CONFIG.max_retries, help="Max retries for retriable relay errors")
+    hs_serve.add_argument("--retry-backoff-base", type=float, default=DEFAULT_RELIABILITY_CONFIG.retry_backoff_base_s, help="Retry backoff base seconds")
+    hs_serve.add_argument("--retry-backoff-max", type=float, default=DEFAULT_RELIABILITY_CONFIG.retry_backoff_max_s, help="Retry backoff max seconds")
     hs_serve.add_argument("--once", action="store_true", help="Run a single poll cycle and exit")
 
     hs_connect = hs_sub.add_parser("connect", help="Build rendezvous flow and open HS stream")
@@ -189,6 +214,9 @@ def _build_parser() -> argparse.ArgumentParser:
     hs_recv.add_argument("--session", default=".latnet-hs.json", help="HS session file")
     hs_recv.add_argument("--follow", action="store_true", help="Keep polling for messages until timeout or interruption")
     hs_recv.add_argument("--timeout", type=float, default=5.0, help="Timeout in seconds for receive loop")
+    hs_recv.add_argument("--max-retries", type=int, default=DEFAULT_RELIABILITY_CONFIG.max_retries, help="Max retries for retriable relay errors")
+    hs_recv.add_argument("--retry-backoff-base", type=float, default=DEFAULT_RELIABILITY_CONFIG.retry_backoff_base_s, help="Retry backoff base seconds")
+    hs_recv.add_argument("--retry-backoff-max", type=float, default=DEFAULT_RELIABILITY_CONFIG.retry_backoff_max_s, help="Retry backoff max seconds")
 
     hs_end = hs_sub.add_parser("end", help="Close/finalize HS session")
     hs_end.add_argument("--session", default=".latnet-hs.json", help="HS session file")
@@ -270,19 +298,23 @@ def main(argv: list[str] | None = None) -> int:
             }
         )
 
+        reliability = _reliability_config_from_args(args)
         while True:
             handled = 0
             for intro in intro_circuits:
-                items = poll_intro_requests(intro["circuit"])
-                for item in items:
-                    result = handle_intro_request_with_echo(item)
-                    _print_json({"ok": True, "mode": "service", "event": "intro_request", "result": result})
-                    handled += 1
+                try:
+                    items = poll_intro_requests(intro["circuit"], config=reliability)
+                    for item in items:
+                        result = handle_intro_request_with_echo(item, config=reliability)
+                        _print_json({"ok": True, "mode": "service", "event": "intro_request", "result": result})
+                        handled += 1
+                except Exception as exc:
+                    _print_json(_runtime_error_output(exc, mode="service", event="intro_poll"))
 
             if args.once:
                 _print_json({"ok": True, "mode": "service", "status": "runtime_stopped", "handled": handled})
                 return 0
-            time.sleep(max(0.01, args.poll_interval))
+            time.sleep(max(0.01, reliability.poll_interval_s))
 
     if args.top_cmd == "hs" and args.hs_cmd == "connect":
         descriptor = fetch_hidden_service_descriptor_from_directory(
@@ -362,10 +394,17 @@ def main(argv: list[str] | None = None) -> int:
         circuit = _hs_circuit_from_json(session["circuit"])
         cookie = str(session["rendezvous_cookie"])
 
+        reliability = ReliabilityConfig(
+            join_timeout_s=max(0.0, float(args.timeout)),
+            poll_interval_s=0.1,
+            max_retries=max(1, int(args.max_retries)),
+            retry_backoff_base_s=max(0.0, float(args.retry_backoff_base)),
+            retry_backoff_max_s=max(0.0, float(args.retry_backoff_max)),
+        )
         deadline = time.monotonic() + max(0.0, float(args.timeout))
         try:
             while True:
-                payload = rendezvous_recv(circuit, cookie)
+                payload = rendezvous_recv(circuit, cookie, config=reliability)
                 if payload is not None:
                     _print_json(
                         {
@@ -379,17 +418,38 @@ def main(argv: list[str] | None = None) -> int:
                     return 0
                 if not args.follow or time.monotonic() >= deadline:
                     _print_json(
-                        {
-                            "ok": False,
-                            "service_name": session.get("service_name"),
-                            "rendezvous_cookie": cookie,
-                            "payload": None,
-                            "received_at": int(time.time()),
-                            "error": "timeout",
-                        }
+                        _runtime_error_output(
+                            HiddenServiceRuntimeError("timeout waiting for rendezvous payload"),
+                            service_name=session.get("service_name"),
+                            rendezvous_cookie=cookie,
+                            payload=None,
+                            received_at=int(time.time()),
+                        )
                     )
                     return 1
-                time.sleep(0.1)
+                time.sleep(reliability.poll_interval_s)
+        except HiddenServiceRuntimeError as exc:
+            _print_json(
+                _runtime_error_output(
+                    exc,
+                    service_name=session.get("service_name"),
+                    rendezvous_cookie=cookie,
+                    payload=None,
+                    received_at=int(time.time()),
+                )
+            )
+            return 1
+        except Exception as exc:
+            _print_json(
+                _runtime_error_output(
+                    exc,
+                    service_name=session.get("service_name"),
+                    rendezvous_cookie=cookie,
+                    payload=None,
+                    received_at=int(time.time()),
+                )
+            )
+            return 1
         except KeyboardInterrupt:
             _print_json(
                 {
