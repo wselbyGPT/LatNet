@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 
 
 def test_cli_hs_serve_once_invokes_runtime_and_exits(tmp_path, latnet_modules, monkeypatch, capsys):
@@ -39,7 +40,7 @@ def test_cli_hs_serve_once_invokes_runtime_and_exits(tmp_path, latnet_modules, m
     assert any("runtime_stopped" in line for line in output_lines)
 
 
-def test_cli_hs_connect_send_end_session_roundtrip(tmp_path, latnet_modules, monkeypatch, capsys):
+def test_cli_hs_connect_send_recv_roundtrip(tmp_path, latnet_modules, monkeypatch, capsys):
     cli = latnet_modules["cli"]
 
     service_name = "abcdabcdabcdabcdabcdabcdabcdabcd.lettuce"
@@ -77,16 +78,85 @@ def test_cli_hs_connect_send_end_session_roundtrip(tmp_path, latnet_modules, mon
     runtime = latnet_modules["hidden_service_runtime"]
     monkeypatch.setattr(runtime, "_send_circuit_cmd", lambda *_args, **_kwargs: {"cmd": "ok", "joined": True})
     monkeypatch.setattr(cli, "rendezvous_send", lambda *_args, **_kwargs: {"cmd": "RENDEZVOUS_RELAYED"})
+    monkeypatch.setattr(cli, "rendezvous_recv", lambda *_args, **_kwargs: "hello-back")
 
     assert cli.main(["hs", "connect", service_name, str(relay_path), "--session", str(session_path)]) == 0
     assert cli.main(["hs", "send", "--session", str(session_path), "hello"]) == 0
-    assert cli.main(["hs", "end", "--session", str(session_path), "--payload", "bye"]) == 0
+    assert cli.main(["hs", "recv", "--session", str(session_path)]) == 0
 
     saved = json.loads(session_path.read_text(encoding="utf-8"))
     assert saved["service_name"] == service_name
-    assert "ended_at" in saved
+    assert "ended_at" not in saved
     out = capsys.readouterr().out
     assert "RENDEZVOUS_RELAYED" in out
+    assert '"payload": "hello-back"' in out
+
+
+def test_cli_hs_end_marks_session_and_rejects_future_send(tmp_path, latnet_modules, monkeypatch):
+    cli = latnet_modules["cli"]
+
+    session_path = tmp_path / "hs-session.json"
+    session_path.write_text(
+        json.dumps(
+            {
+                "service_name": "svc.lettuce",
+                "rendezvous_cookie": "cookie-1",
+                "circuit": {
+                    "circuit_id": "c-1",
+                    "guard_host": "127.0.0.1",
+                    "guard_port": 9014,
+                    "forward_keys": ["Zg=="],
+                    "reverse_keys": ["cg=="],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cli, "rendezvous_close", lambda *_args, **_kwargs: {"cmd": "RENDEZVOUS_RELAYED"})
+
+    assert cli.main(["hs", "end", "--session", str(session_path), "--payload", "bye"]) == 0
+    saved = json.loads(session_path.read_text(encoding="utf-8"))
+    assert saved["end_reason"] == "user_end"
+    assert saved["final_payload"] == "bye"
+    assert "ended_at" in saved
+
+    assert cli.main(["hs", "send", "--session", str(session_path), "later"]) == 1
+
+
+def test_cli_hs_recv_follow_exits_on_timeout_and_interruption(tmp_path, latnet_modules, monkeypatch):
+    cli = latnet_modules["cli"]
+    session_path = tmp_path / "hs-session.json"
+    session_path.write_text(
+        json.dumps(
+            {
+                "service_name": "svc.lettuce",
+                "rendezvous_cookie": "cookie-1",
+                "circuit": {
+                    "circuit_id": "c-1",
+                    "guard_host": "127.0.0.1",
+                    "guard_port": 9014,
+                    "forward_keys": ["Zg=="],
+                    "reverse_keys": ["cg=="],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(cli, "rendezvous_recv", lambda *_args, **_kwargs: None)
+    assert cli.main(["hs", "recv", "--session", str(session_path), "--follow", "--timeout", "0.01"]) == 1
+
+    calls = {"count": 0}
+
+    def _interrupt_after_first(*_args, **_kwargs):
+        calls["count"] += 1
+        if calls["count"] > 1:
+            raise KeyboardInterrupt()
+        return None
+
+    monkeypatch.setattr(cli, "rendezvous_recv", _interrupt_after_first)
+    monkeypatch.setattr(time, "sleep", lambda *_args, **_kwargs: None)
+    assert cli.main(["hs", "recv", "--session", str(session_path), "--follow", "--timeout", "5"]) == 130
 
 
 def test_cli_hs_publish_invokes_client_helper(tmp_path, latnet_modules, monkeypatch, capsys):

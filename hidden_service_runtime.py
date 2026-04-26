@@ -196,6 +196,10 @@ def rendezvous_send(circuit: ServiceCircuit, rendezvous_cookie: str, payload: st
     )
 
 
+def rendezvous_close(circuit: ServiceCircuit, rendezvous_cookie: str, final_payload: str = "") -> dict[str, Any]:
+    return rendezvous_send(circuit, rendezvous_cookie, final_payload)
+
+
 def handle_intro_request_with_echo(intro_request: dict[str, Any], *, service_prefix: str = "echo") -> dict[str, Any]:
     cookie = intro_request.get("rendezvous_cookie")
     intro = intro_request.get("introduction")
@@ -240,6 +244,7 @@ __all__ = [
     "handle_intro_request_with_echo",
     "load_service_material",
     "poll_intro_requests",
+    "rendezvous_close",
     "rendezvous_recv",
     "rendezvous_send",
 ]

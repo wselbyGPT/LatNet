@@ -35,6 +35,8 @@ from .hidden_service_runtime import (
     handle_intro_request_with_echo,
     load_service_material,
     poll_intro_requests,
+    rendezvous_close,
+    rendezvous_recv,
     rendezvous_send,
 )
 from .relay import RelayServer, init_relay_file, run_relay_server
@@ -179,11 +181,16 @@ def _build_parser() -> argparse.ArgumentParser:
     hs_connect.add_argument("--port", type=int, default=9200, help="Directory port")
     hs_connect.add_argument("--session", default=".latnet-hs.json", help="HS session output file")
 
-    hs_send = hs_sub.add_parser("send", help="Send HS payload over persisted HS session")
+    hs_send = hs_sub.add_parser("send", help="Relay a message payload over persisted HS session")
     hs_send.add_argument("--session", default=".latnet-hs.json", help="HS session file")
     hs_send.add_argument("payload", help="Payload string")
 
-    hs_end = hs_sub.add_parser("end", help="End HS stream")
+    hs_recv = hs_sub.add_parser("recv", help="Receive message payload from persisted HS session")
+    hs_recv.add_argument("--session", default=".latnet-hs.json", help="HS session file")
+    hs_recv.add_argument("--follow", action="store_true", help="Keep polling for messages until timeout or interruption")
+    hs_recv.add_argument("--timeout", type=float, default=5.0, help="Timeout in seconds for receive loop")
+
+    hs_end = hs_sub.add_parser("end", help="Close/finalize HS session")
     hs_end.add_argument("--session", default=".latnet-hs.json", help="HS session file")
     hs_end.add_argument("--payload", default="", help="Optional END payload")
 
@@ -341,17 +348,71 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.top_cmd == "hs" and args.hs_cmd == "send":
         session = _load_hs_session(args.session)
+        if session.get("ended_at"):
+            _print_json({"ok": False, "error": "session already ended"})
+            return 1
         circuit = _hs_circuit_from_json(session["circuit"])
         reply = rendezvous_send(circuit, str(session["rendezvous_cookie"]), args.payload)
         _save_hs_session(args.session, session)
         _print_json(reply)
         return 0
 
-    if args.top_cmd == "hs" and args.hs_cmd == "end":
+    if args.top_cmd == "hs" and args.hs_cmd == "recv":
         session = _load_hs_session(args.session)
         circuit = _hs_circuit_from_json(session["circuit"])
-        reply = rendezvous_send(circuit, str(session["rendezvous_cookie"]), args.payload)
+        cookie = str(session["rendezvous_cookie"])
+
+        deadline = time.monotonic() + max(0.0, float(args.timeout))
+        try:
+            while True:
+                payload = rendezvous_recv(circuit, cookie)
+                if payload is not None:
+                    _print_json(
+                        {
+                            "ok": True,
+                            "service_name": session.get("service_name"),
+                            "rendezvous_cookie": cookie,
+                            "payload": payload,
+                            "received_at": int(time.time()),
+                        }
+                    )
+                    return 0
+                if not args.follow or time.monotonic() >= deadline:
+                    _print_json(
+                        {
+                            "ok": False,
+                            "service_name": session.get("service_name"),
+                            "rendezvous_cookie": cookie,
+                            "payload": None,
+                            "received_at": int(time.time()),
+                            "error": "timeout",
+                        }
+                    )
+                    return 1
+                time.sleep(0.1)
+        except KeyboardInterrupt:
+            _print_json(
+                {
+                    "ok": False,
+                    "service_name": session.get("service_name"),
+                    "rendezvous_cookie": cookie,
+                    "payload": None,
+                    "received_at": int(time.time()),
+                    "error": "interrupted",
+                }
+            )
+            return 130
+
+    if args.top_cmd == "hs" and args.hs_cmd == "end":
+        session = _load_hs_session(args.session)
+        if session.get("ended_at"):
+            _print_json({"ok": False, "error": "session already ended"})
+            return 1
+        circuit = _hs_circuit_from_json(session["circuit"])
+        reply = rendezvous_close(circuit, str(session["rendezvous_cookie"]), args.payload)
         session["ended_at"] = int(time.time())
+        session["end_reason"] = "user_end"
+        session["final_payload"] = args.payload
         _save_hs_session(args.session, session)
         _print_json(reply)
         return 0
