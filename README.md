@@ -18,7 +18,11 @@ Relay JSON files must be provided in path order (guard to exit).
 
 ## Protocol documentation
 
-- `docs/protocol_notes.md` describes stream `seq` monotonicity and relay cell command constraints.
+- `docs/protocol_notes.md` describes stream `seq` monotonicity, relay cell command constraints, and HS event reference notes.
+
+## Operations documentation
+
+- `docs/operator_playbook.md` provides hidden-service bootstrap, descriptor publish/rotation, troubleshooting, and observability guidance.
 
 ## Hidden service runtime reliability tuning
 

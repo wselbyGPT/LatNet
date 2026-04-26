@@ -36,3 +36,8 @@ The CLI hidden-service flows now emit JSON lines with a standard envelope:
 | `hs.error` | `error` | `error`, `metrics` |
 
 Runtime summary metrics are emitted in the `metrics` field on shutdown events, including intro request counts, rendezvous join success/failure and latency stats, and relay command failures by error type.
+
+## Operations documentation
+
+- `docs/operator_playbook.md` is the primary operator runbook for hidden service bootstrap, publish/rotation, troubleshooting, and alert thresholds.
+
