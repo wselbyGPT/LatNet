@@ -36,6 +36,24 @@ def _req_int(src: dict[str, Any], field: str) -> int:
     return value
 
 
+def _opt_int(src: dict[str, Any], field: str) -> int | None:
+    value = src.get(field)
+    if value is None:
+        return None
+    if not isinstance(value, int):
+        raise ValueError(f"missing or invalid field: {field}")
+    return value
+
+
+def _opt_str(src: dict[str, Any], field: str) -> str | None:
+    value = src.get(field)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"missing or invalid field: {field}")
+    return value
+
+
 @dataclass(frozen=True)
 class NextHop:
     host: str
@@ -110,6 +128,26 @@ class ExitCellLayer:
 class ReplyCellLayer:
     cmd: Literal["REPLY_CELL"]
     cell: StreamCell
+
+
+@dataclass(frozen=True)
+class PublishHSDescriptorRequest:
+    type: Literal["PUBLISH_HS_DESCRIPTOR"]
+    service_name: str
+    descriptor: dict[str, Any]
+    expected_previous_revision: int | None = None
+    idempotency_key: str | None = None
+
+
+@dataclass(frozen=True)
+class PublishHSDescriptorResponse:
+    ok: bool
+    service_name: str | None = None
+    accepted_revision: int | None = None
+    expected_previous_revision: int | None = None
+    idempotency_key: str | None = None
+    error: str | None = None
+    error_class: str | None = None
 
 
 def parse_build_envelope(obj: Any) -> BuildEnvelope:
@@ -198,3 +236,42 @@ def parse_get_hidden_service_descriptor_request(obj: Any) -> str:
     if src.get("type") != "GET_HS_DESCRIPTOR":
         raise ValueError("unknown message type")
     return _req_str(src, "service_name")
+
+
+def parse_publish_hidden_service_descriptor_request(obj: Any) -> PublishHSDescriptorRequest:
+    src = _as_dict(obj, context="directory request")
+    if src.get("type") != "PUBLISH_HS_DESCRIPTOR":
+        raise ValueError("unknown message type")
+    expected_previous_revision = _opt_int(src, "expected_previous_revision")
+    if expected_previous_revision is not None and expected_previous_revision < 0:
+        raise ValueError("missing or invalid field: expected_previous_revision")
+    return PublishHSDescriptorRequest(
+        type="PUBLISH_HS_DESCRIPTOR",
+        service_name=_req_str(src, "service_name"),
+        descriptor=_as_dict(src.get("descriptor"), context="descriptor"),
+        expected_previous_revision=expected_previous_revision,
+        idempotency_key=_opt_str(src, "idempotency_key"),
+    )
+
+
+def parse_publish_hidden_service_descriptor_response(obj: Any) -> PublishHSDescriptorResponse:
+    src = _as_dict(obj, context="directory response")
+    ok = src.get("ok")
+    if not isinstance(ok, bool):
+        raise ValueError("missing or invalid field: ok")
+    if ok:
+        return PublishHSDescriptorResponse(
+            ok=True,
+            service_name=_req_str(src, "service_name"),
+            accepted_revision=_req_int(src, "accepted_revision"),
+            expected_previous_revision=_opt_int(src, "expected_previous_revision"),
+            idempotency_key=_opt_str(src, "idempotency_key"),
+        )
+    return PublishHSDescriptorResponse(
+        ok=False,
+        error=_req_str(src, "error"),
+        error_class=_req_str(src, "error_class"),
+        service_name=_opt_str(src, "service_name"),
+        expected_previous_revision=_opt_int(src, "expected_previous_revision"),
+        idempotency_key=_opt_str(src, "idempotency_key"),
+    )

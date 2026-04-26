@@ -138,13 +138,20 @@ def test_non_object_wire_message_returns_error(tmp_path, latnet_modules):
         client_sock.close()
 
 
-def _make_hs_descriptor_doc(latnet_modules, tmp_path):
+def _make_hs_descriptor_doc(
+    latnet_modules,
+    tmp_path,
+    *,
+    revision: int = 1,
+    valid_until_offset: int = 60,
+    service: dict | None = None,
+):
     hs_keys = latnet_modules["hidden_service_keys"]
     hs_desc = latnet_modules["models.hidden_service_descriptor"]
     util = latnet_modules["util"]
 
     now = int(time.time())
-    service = hs_keys.generate_service_master("svc", tmp_path / "service_master.json")
+    service = service or hs_keys.generate_service_master("svc", tmp_path / "service_master.json")
     desc_signing = hs_keys.generate_descriptor_signing_key()
     cert = hs_keys.build_descriptor_signing_certificate(
         service,
@@ -158,8 +165,8 @@ def _make_hs_descriptor_doc(latnet_modules, tmp_path):
         "descriptor_signing_public_key": desc_signing["descriptor_signing_public_key"],
         "descriptor_signing_certificate": cert,
         "valid_after": now - 5,
-        "valid_until": now + 60,
-        "revision": 1,
+        "valid_until": now + valid_until_offset,
+        "revision": revision,
         "period": 1,
         "introduction_points": [
             {
@@ -224,5 +231,117 @@ def test_get_hidden_service_descriptor_not_found(tmp_path, latnet_modules):
 
         assert response["ok"] is False
         assert "hidden service descriptor not found" in response["error"]
+    finally:
+        client_sock.close()
+
+
+def test_publish_hidden_service_descriptor_success_and_rotation(tmp_path, latnet_modules):
+    wire = latnet_modules["wire"]
+    directory_mod = latnet_modules["directory"]
+    hs_keys = latnet_modules["hidden_service_keys"]
+
+    service = hs_keys.generate_service_master("svc", tmp_path / "service_master.json")
+    first = _make_hs_descriptor_doc(latnet_modules, tmp_path, revision=1, service=service)
+    service_name = first["signed"]["service_name"]
+    second = _make_hs_descriptor_doc(latnet_modules, tmp_path, revision=2, service=service)
+
+    bundle_path = tmp_path / "bundle.json"
+    bundle_path.write_text('{"version":1,"descriptors":[]}', encoding="utf-8")
+    hs_store_path = tmp_path / "hs_store.json"
+    hs_store_path.write_text(json.dumps({"version": 2, "descriptors": {}}), encoding="utf-8")
+    server = directory_mod.DirectoryServer(str(bundle_path), hidden_service_store_path=str(hs_store_path))
+
+    for payload in (
+        {"type": "PUBLISH_HS_DESCRIPTOR", "service_name": service_name, "descriptor": first},
+        {"type": "PUBLISH_HS_DESCRIPTOR", "service_name": service_name, "descriptor": second, "expected_previous_revision": 1},
+    ):
+        client_sock, server_sock = socket.socketpair()
+        try:
+            thread = _run_handle_conn(server, server_sock)
+            wire.send_msg(client_sock, payload)
+            response = wire.recv_msg(client_sock)
+            thread.join(timeout=1)
+            assert response["ok"] is True
+        finally:
+            client_sock.close()
+
+    saved = json.loads(hs_store_path.read_text(encoding="utf-8"))
+    assert saved["descriptors"][service_name]["signed"]["revision"] == 2
+
+
+def test_publish_rejects_same_or_lower_revision(tmp_path, latnet_modules):
+    wire = latnet_modules["wire"]
+    directory_mod = latnet_modules["directory"]
+    hs_keys = latnet_modules["hidden_service_keys"]
+    service = hs_keys.generate_service_master("svc", tmp_path / "service_master.json")
+    descriptor = _make_hs_descriptor_doc(latnet_modules, tmp_path, revision=2, service=service)
+    service_name = descriptor["signed"]["service_name"]
+
+    bundle_path = tmp_path / "bundle.json"
+    bundle_path.write_text('{"version":1,"descriptors":[]}', encoding="utf-8")
+    hs_store_path = tmp_path / "hs_store.json"
+    hs_store_path.write_text(json.dumps({"version": 2, "descriptors": {service_name: descriptor}}), encoding="utf-8")
+    server = directory_mod.DirectoryServer(str(bundle_path), hidden_service_store_path=str(hs_store_path))
+
+    for revision in (2, 1):
+        candidate = _make_hs_descriptor_doc(latnet_modules, tmp_path, revision=revision, service=service)
+        client_sock, server_sock = socket.socketpair()
+        try:
+            thread = _run_handle_conn(server, server_sock)
+            wire.send_msg(client_sock, {"type": "PUBLISH_HS_DESCRIPTOR", "service_name": service_name, "descriptor": candidate})
+            response = wire.recv_msg(client_sock)
+            thread.join(timeout=1)
+            assert response["ok"] is False
+            assert response["error_class"] == "revision_conflict"
+        finally:
+            client_sock.close()
+
+
+def test_publish_rejects_expired_descriptor(tmp_path, latnet_modules):
+    wire = latnet_modules["wire"]
+    directory_mod = latnet_modules["directory"]
+    descriptor = _make_hs_descriptor_doc(latnet_modules, tmp_path, revision=1, valid_until_offset=-1)
+    service_name = descriptor["signed"]["service_name"]
+
+    bundle_path = tmp_path / "bundle.json"
+    bundle_path.write_text('{"version":1,"descriptors":[]}', encoding="utf-8")
+    hs_store_path = tmp_path / "hs_store.json"
+    hs_store_path.write_text(json.dumps({"version": 2, "descriptors": {}}), encoding="utf-8")
+    server = directory_mod.DirectoryServer(str(bundle_path), hidden_service_store_path=str(hs_store_path))
+
+    client_sock, server_sock = socket.socketpair()
+    try:
+        thread = _run_handle_conn(server, server_sock)
+        wire.send_msg(client_sock, {"type": "PUBLISH_HS_DESCRIPTOR", "service_name": service_name, "descriptor": descriptor})
+        response = wire.recv_msg(client_sock)
+        thread.join(timeout=1)
+        assert response["ok"] is False
+        assert response["error_class"] == "expired_descriptor"
+    finally:
+        client_sock.close()
+
+
+def test_publish_rejects_descriptor_service_name_mismatch(tmp_path, latnet_modules):
+    wire = latnet_modules["wire"]
+    directory_mod = latnet_modules["directory"]
+    descriptor = _make_hs_descriptor_doc(latnet_modules, tmp_path, revision=1)
+    service_name = descriptor["signed"]["service_name"]
+    wrong_name = "f" * 32 + ".lettuce"
+
+    bundle_path = tmp_path / "bundle.json"
+    bundle_path.write_text('{"version":1,"descriptors":[]}', encoding="utf-8")
+    hs_store_path = tmp_path / "hs_store.json"
+    hs_store_path.write_text(json.dumps({"version": 2, "descriptors": {}}), encoding="utf-8")
+    server = directory_mod.DirectoryServer(str(bundle_path), hidden_service_store_path=str(hs_store_path))
+
+    client_sock, server_sock = socket.socketpair()
+    try:
+        thread = _run_handle_conn(server, server_sock)
+        wire.send_msg(client_sock, {"type": "PUBLISH_HS_DESCRIPTOR", "service_name": wrong_name, "descriptor": descriptor})
+        response = wire.recv_msg(client_sock)
+        thread.join(timeout=1)
+        assert response["ok"] is False
+        assert response["error_class"] == "invalid_signature"
+        assert service_name != wrong_name
     finally:
         client_sock.close()

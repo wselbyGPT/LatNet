@@ -140,3 +140,39 @@ def test_failure_branch_join_timeout_returns_no_payload(monkeypatch, latnet_modu
     assert result["joined"] is False
     assert result["received_payload"] is None
     assert result["echoed_payload"] is None
+
+
+def test_publish_hidden_service_descriptor_maps_error_classes(monkeypatch, latnet_modules):
+    client = latnet_modules["client"]
+
+    class _FakeSocket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr("socket.create_connection", lambda *_args, **_kwargs: _FakeSocket())
+    monkeypatch.setattr(client, "send_msg", lambda *_args, **_kwargs: None)
+
+    descriptor = {
+        "version": 2,
+        "sigalg": "ed25519",
+        "signed": {"service_name": "a" * 32 + ".lettuce"},
+        "signature": "c2ln",
+    }
+
+    cases = [
+        ("revision_conflict", client.PublishDescriptorRevisionConflictError),
+        ("expired_descriptor", client.PublishDescriptorExpiredError),
+        ("invalid_signature", client.PublishDescriptorInvalidSignatureError),
+        ("unauthorized", client.PublishDescriptorUnauthorizedError),
+    ]
+    for error_class, exc_type in cases:
+        monkeypatch.setattr(client, "recv_msg", lambda *_args, **_kwargs: {"ok": False, "error_class": error_class, "error": "nope"})
+        with pytest.raises(exc_type):
+            client.publish_hidden_service_descriptor_to_directory(
+                "127.0.0.1",
+                "a" * 32 + ".lettuce",
+                descriptor,
+            )

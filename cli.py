@@ -22,6 +22,7 @@ from .client import (
     fetch_bundle_from_directory,
     fetch_bundle_to_file,
     fetch_hidden_service_descriptor_from_directory,
+    publish_hidden_service_descriptor_to_directory,
     open_stream,
     send_stream_data,
     select_intro_point_for_phase1,
@@ -186,6 +187,14 @@ def _build_parser() -> argparse.ArgumentParser:
     hs_end.add_argument("--session", default=".latnet-hs.json", help="HS session file")
     hs_end.add_argument("--payload", default="", help="Optional END payload")
 
+    hs_publish = hs_sub.add_parser("publish", help="Publish hidden service descriptor to directory")
+    hs_publish.add_argument("--service-master", required=True, help="Hidden service master key JSON")
+    hs_publish.add_argument("--descriptor", required=True, help="Hidden service descriptor JSON")
+    hs_publish.add_argument("--host", default="127.0.0.1", help="Directory host")
+    hs_publish.add_argument("--port", type=int, default=9200, help="Directory port")
+    hs_publish.add_argument("--expected-revision", type=int, default=None, help="Expected previous descriptor revision")
+    hs_publish.add_argument("--idempotency-key", default=None, help="Optional idempotency key")
+
     return parser
 
 
@@ -347,6 +356,21 @@ def main(argv: list[str] | None = None) -> int:
         _print_json(reply)
         return 0
 
+    if args.top_cmd == "hs" and args.hs_cmd == "publish":
+        service_master = load_json(args.service_master)
+        service_name = str(service_master["service_name"])
+        descriptor = load_json(args.descriptor)
+        response = publish_hidden_service_descriptor_to_directory(
+            host=args.host,
+            port=args.port,
+            service_name=service_name,
+            descriptor=descriptor,
+            expected_previous_revision=args.expected_revision,
+            idempotency_key=args.idempotency_key,
+        )
+        _print_json(response)
+        return 0
+
     parser.error("unsupported command")
     return 2
 
@@ -362,6 +386,7 @@ __all__ = [
     "fetch_bundle_from_directory",
     "fetch_bundle_to_file",
     "fetch_hidden_service_descriptor_from_directory",
+    "publish_hidden_service_descriptor_to_directory",
     "build_circuit",
     "open_stream",
     "send_stream_data",

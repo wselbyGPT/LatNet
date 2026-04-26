@@ -25,6 +25,8 @@ from .protocol import (
     ForwardBuildLayer,
     ForwardCellLayer,
     NextHop,
+    PublishHSDescriptorRequest,
+    PublishHSDescriptorResponse,
     ReplyCellLayer,
     StreamCell,
     parse_build_envelope,
@@ -34,6 +36,8 @@ from .protocol import (
     parse_get_bundle_request,
     parse_get_hidden_service_descriptor_request,
     parse_layer,
+    parse_publish_hidden_service_descriptor_request,
+    parse_publish_hidden_service_descriptor_response,
     parse_stream_cell,
 )
 
@@ -58,6 +62,8 @@ __all__ = [
     "ForwardBuildLayer",
     "ForwardCellLayer",
     "NextHop",
+    "PublishHSDescriptorRequest",
+    "PublishHSDescriptorResponse",
     "ReplyCellLayer",
     "StreamCell",
     "parse_build_envelope",
@@ -67,5 +73,7 @@ __all__ = [
     "parse_get_bundle_request",
     "parse_get_hidden_service_descriptor_request",
     "parse_layer",
+    "parse_publish_hidden_service_descriptor_request",
+    "parse_publish_hidden_service_descriptor_response",
     "parse_stream_cell",
 ]

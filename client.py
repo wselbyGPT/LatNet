@@ -11,12 +11,36 @@ from .constants import DEFAULT_TIMEOUT
 from .crypto import decrypt_layer, derive_hop_keys, encrypt_layer
 from .models.hidden_service import parse_lettuce_name
 from .models.hidden_service_descriptor import verify_hidden_service_descriptor_v2
+from .models.protocol import (
+    parse_publish_hidden_service_descriptor_request,
+    parse_publish_hidden_service_descriptor_response,
+)
 from .util import atomic_write_json, b64d, b64e
 from .wire import recv_msg, send_msg
 
 NO_DESCRIPTOR_ERROR = "no descriptor available for hidden service"
 EXPIRED_DESCRIPTOR_ERROR = "hidden service descriptor is expired"
 NO_REACHABLE_INTRO_POINTS_ERROR = "all introduction points are expired or unreachable"
+
+
+class PublishDescriptorError(ValueError):
+    pass
+
+
+class PublishDescriptorRevisionConflictError(PublishDescriptorError):
+    pass
+
+
+class PublishDescriptorExpiredError(PublishDescriptorError):
+    pass
+
+
+class PublishDescriptorInvalidSignatureError(PublishDescriptorError):
+    pass
+
+
+class PublishDescriptorUnauthorizedError(PublishDescriptorError):
+    pass
 
 
 @dataclass
@@ -89,6 +113,63 @@ def fetch_hidden_service_descriptor_from_directory(host: str, service_name: str,
         raise ValueError(EXPIRED_DESCRIPTOR_ERROR)
     order_intro_points_for_phase1(descriptor, now=now)
     return descriptor
+
+
+def publish_hidden_service_descriptor_to_directory(
+    host: str,
+    service_name: str,
+    descriptor: dict[str, Any],
+    *,
+    port: int = 9200,
+    expected_previous_revision: int | None = None,
+    idempotency_key: str | None = None,
+) -> dict[str, Any]:
+    import socket
+
+    parse_lettuce_name(service_name)
+    request = parse_publish_hidden_service_descriptor_request(
+        {
+            "type": "PUBLISH_HS_DESCRIPTOR",
+            "service_name": service_name,
+            "descriptor": descriptor,
+            "expected_previous_revision": expected_previous_revision,
+            "idempotency_key": idempotency_key,
+        }
+    )
+    with socket.create_connection((host, port), timeout=DEFAULT_TIMEOUT) as sock:
+        send_msg(
+            sock,
+            {
+                "type": request.type,
+                "service_name": request.service_name,
+                "descriptor": request.descriptor,
+                "expected_previous_revision": request.expected_previous_revision,
+                "idempotency_key": request.idempotency_key,
+            },
+        )
+        response = recv_msg(sock)
+
+    parsed = parse_publish_hidden_service_descriptor_response(response)
+    if parsed.ok:
+        return {
+            "ok": True,
+            "service_name": parsed.service_name,
+            "accepted_revision": parsed.accepted_revision,
+            "expected_previous_revision": parsed.expected_previous_revision,
+            "idempotency_key": parsed.idempotency_key,
+        }
+
+    error_class = parsed.error_class or "directory_error"
+    error_message = parsed.error or "directory returned error"
+    if error_class == "revision_conflict":
+        raise PublishDescriptorRevisionConflictError(error_message)
+    if error_class == "expired_descriptor":
+        raise PublishDescriptorExpiredError(error_message)
+    if error_class == "invalid_signature":
+        raise PublishDescriptorInvalidSignatureError(error_message)
+    if error_class == "unauthorized":
+        raise PublishDescriptorUnauthorizedError(error_message)
+    raise PublishDescriptorError(error_message)
 
 
 def order_intro_points_for_phase1(descriptor: dict[str, Any], *, now: int | None = None) -> list[dict[str, Any]]:

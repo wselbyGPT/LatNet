@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import time
 
+import pytest
+
 
 def _enc(mod, key: bytes, payload: dict):
     return mod.encrypt_layer(key, payload)
@@ -168,3 +170,35 @@ def test_rejects_malformed_cookie_role_and_unknown_cmds(latnet_modules, relay_do
     )
     assert wrong_role_cmd["ok"] is False
     assert "unknown intro cmd" in wrong_role_cmd["error"]
+
+
+def test_publish_hs_descriptor_protocol_models_validate_fields(latnet_modules):
+    protocol = latnet_modules["models"]
+
+    parsed = protocol.parse_publish_hidden_service_descriptor_request(
+        {
+            "type": "PUBLISH_HS_DESCRIPTOR",
+            "service_name": "a" * 32 + ".lettuce",
+            "descriptor": {"version": 2},
+            "expected_previous_revision": 1,
+            "idempotency_key": "idem-1",
+        }
+    )
+    assert parsed.service_name.endswith(".lettuce")
+    assert parsed.expected_previous_revision == 1
+    assert parsed.idempotency_key == "idem-1"
+
+    with pytest.raises(ValueError, match="service_name"):
+        protocol.parse_publish_hidden_service_descriptor_request(
+            {"type": "PUBLISH_HS_DESCRIPTOR", "descriptor": {"version": 2}}
+        )
+
+    ok_response = protocol.parse_publish_hidden_service_descriptor_response(
+        {"ok": True, "service_name": "a" * 32 + ".lettuce", "accepted_revision": 2}
+    )
+    assert ok_response.accepted_revision == 2
+
+    fail_response = protocol.parse_publish_hidden_service_descriptor_response(
+        {"ok": False, "error_class": "revision_conflict", "error": "bad revision"}
+    )
+    assert fail_response.error_class == "revision_conflict"
