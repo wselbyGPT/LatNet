@@ -259,6 +259,105 @@ def test_establish_service_rendezvous_retry_exhaustion(monkeypatch, latnet_modul
     assert sleeps == [0.1, 0.2]
 
 
+def test_establish_service_rendezvous_succeeds_when_payload_arrives_before_deadline(monkeypatch, latnet_modules):
+    runtime = latnet_modules["hidden_service_runtime"]
+    circuit = runtime.ServiceCircuit("c1", "127.0.0.1", 1, [b"f"], [b"r"])
+    monkeypatch.setattr(runtime, "build_service_circuit", lambda *_args, **_kwargs: circuit)
+    monkeypatch.setattr(
+        runtime,
+        "_send_circuit_cmd",
+        lambda *_args, **_kwargs: {"cmd": "RENDEZVOUS_STATE", "joined": False},
+    )
+
+    recv_payloads = [None, None, "payload-before-deadline"]
+    recv_calls: list[str] = []
+
+    def _fake_recv(_circuit, rendezvous_cookie, *, config):
+        recv_calls.append(rendezvous_cookie)
+        return recv_payloads.pop(0)
+
+    monotonic_values = iter([10.0, 10.0, 10.5, 10.99])
+    sleeps: list[float] = []
+    monkeypatch.setattr(runtime, "rendezvous_recv", _fake_recv)
+    monkeypatch.setattr(runtime.time, "monotonic", lambda: next(monotonic_values))
+    monkeypatch.setattr(runtime.time, "sleep", lambda v: sleeps.append(v))
+
+    cfg = runtime.ReliabilityConfig(max_retries=1, join_timeout_s=1.0, poll_interval_s=0.05)
+    built, joined = runtime.establish_service_rendezvous({"name": "r", "host": "h", "port": 1}, "cookie", config=cfg)
+
+    assert built is circuit
+    assert joined is True
+    assert recv_calls == ["cookie", "cookie", "cookie"]
+    assert sleeps == [0.05, 0.05]
+
+
+def test_establish_service_rendezvous_raises_when_deadline_reached_without_payload(monkeypatch, latnet_modules):
+    runtime = latnet_modules["hidden_service_runtime"]
+    circuit = runtime.ServiceCircuit("c1", "127.0.0.1", 1, [b"f"], [b"r"])
+    monkeypatch.setattr(runtime, "build_service_circuit", lambda *_args, **_kwargs: circuit)
+    monkeypatch.setattr(
+        runtime,
+        "_send_circuit_cmd",
+        lambda *_args, **_kwargs: {"cmd": "RENDEZVOUS_STATE", "joined": False},
+    )
+
+    recv_calls = {"n": 0}
+    monkeypatch.setattr(
+        runtime,
+        "rendezvous_recv",
+        lambda *_args, **_kwargs: recv_calls.__setitem__("n", recv_calls["n"] + 1) or None,
+    )
+
+    monotonic_values = iter([20.0, 20.0, 20.2, 20.3])
+    sleeps: list[float] = []
+    monkeypatch.setattr(runtime.time, "monotonic", lambda: next(monotonic_values))
+    monkeypatch.setattr(runtime.time, "sleep", lambda v: sleeps.append(v))
+
+    cfg = runtime.ReliabilityConfig(max_retries=1, join_timeout_s=0.3, poll_interval_s=0.1)
+    with pytest.raises(runtime.RendezvousNotJoinedError):
+        runtime.establish_service_rendezvous({"name": "r", "host": "h", "port": 1}, "cookie", config=cfg)
+
+    assert recv_calls["n"] == 2
+    assert sleeps == [0.1, 0.1]
+
+
+@pytest.mark.parametrize(
+    ("join_timeout_s", "monotonic_series", "expected_recv_calls", "expected_sleeps"),
+    [
+        (0.0, [30.0, 30.0], 0, []),
+        (1e-6, [40.0, 40.0, 40.000001], 1, [0.002]),
+    ],
+)
+def test_establish_service_rendezvous_zero_and_tiny_timeouts(monkeypatch, latnet_modules, join_timeout_s, monotonic_series, expected_recv_calls, expected_sleeps):
+    runtime = latnet_modules["hidden_service_runtime"]
+    circuit = runtime.ServiceCircuit("c1", "127.0.0.1", 1, [b"f"], [b"r"])
+    monkeypatch.setattr(runtime, "build_service_circuit", lambda *_args, **_kwargs: circuit)
+    monkeypatch.setattr(
+        runtime,
+        "_send_circuit_cmd",
+        lambda *_args, **_kwargs: {"cmd": "RENDEZVOUS_STATE", "joined": False},
+    )
+
+    recv_calls = {"n": 0}
+    monkeypatch.setattr(
+        runtime,
+        "rendezvous_recv",
+        lambda *_args, **_kwargs: recv_calls.__setitem__("n", recv_calls["n"] + 1) or None,
+    )
+
+    monotonic_values = iter(monotonic_series)
+    sleeps: list[float] = []
+    monkeypatch.setattr(runtime.time, "monotonic", lambda: next(monotonic_values))
+    monkeypatch.setattr(runtime.time, "sleep", lambda v: sleeps.append(v))
+
+    cfg = runtime.ReliabilityConfig(max_retries=1, join_timeout_s=join_timeout_s, poll_interval_s=0.002)
+    with pytest.raises(runtime.RendezvousNotJoinedError):
+        runtime.establish_service_rendezvous({"name": "r", "host": "h", "port": 1}, "cookie", config=cfg)
+
+    assert recv_calls["n"] == expected_recv_calls
+    assert sleeps == expected_sleeps
+
+
 def test_establish_service_rendezvous_protocol_error_is_fatal(monkeypatch, latnet_modules):
     runtime = latnet_modules["hidden_service_runtime"]
     circuit = runtime.ServiceCircuit("c1", "127.0.0.1", 1, [b"f"], [b"r"])
