@@ -213,3 +213,91 @@ def test_cli_hs_send_and_end_use_session(tmp_path, latnet_modules, monkeypatch, 
     assert "ended_at" in session_json
     outputs = capsys.readouterr().out.strip().splitlines()
     assert "RENDEZVOUS_RELAYED" in "\n".join(outputs)
+
+
+def test_cli_circuit_build_from_verified_relays_with_policy_mode(tmp_path, latnet_modules, monkeypatch):
+    cli = latnet_modules["cli"]
+    client = latnet_modules["client"]
+
+    monkeypatch.setattr(
+        cli,
+        "fetch_verified_relays_from_directory",
+        lambda **_kwargs: {
+            "g1": {"name": "g1", "host": "127.0.0.1", "port": 9001, "kemalg": "ML-KEM-768", "public_key": "cA==", "guard_eligible": True, "middle_eligible": True, "exit_eligible": False},
+            "m1": {"name": "m1", "host": "127.0.0.1", "port": 9002, "kemalg": "ML-KEM-768", "public_key": "cA==", "guard_eligible": False, "middle_eligible": True, "exit_eligible": False},
+            "x1": {"name": "x1", "host": "127.0.0.1", "port": 9003, "kemalg": "ML-KEM-768", "public_key": "cA==", "guard_eligible": False, "middle_eligible": True, "exit_eligible": True},
+        },
+    )
+
+    def _fake_build(path_of_relays, circuit_id=None):
+        assert [relay["name"] for relay in path_of_relays] == ["g1", "m1", "x1"]
+        return client.CircuitSession(
+            circuit_id=circuit_id or "cid-policy",
+            guard_host="127.0.0.1",
+            guard_port=9001,
+            hops=[],
+        )
+
+    monkeypatch.setattr(cli, "build_circuit", _fake_build)
+
+    rc = cli.main(
+        [
+            "circuit",
+            "build",
+            "--directory-host",
+            "127.0.0.1",
+            "--allow-legacy-single-authority",
+            "--policy",
+            "first_valid",
+            "--middle-count",
+            "1",
+            "--session",
+            str(tmp_path / "session.json"),
+        ]
+    )
+
+    assert rc == 0
+
+
+def test_cli_circuit_build_from_verified_relays_with_ordered_names(tmp_path, latnet_modules, monkeypatch):
+    cli = latnet_modules["cli"]
+    client = latnet_modules["client"]
+
+    monkeypatch.setattr(
+        cli,
+        "fetch_verified_relays_from_directory",
+        lambda **_kwargs: {
+            "g1": {"name": "g1", "host": "127.0.0.1", "port": 9001, "kemalg": "ML-KEM-768", "public_key": "cA==", "guard_eligible": True, "middle_eligible": True, "exit_eligible": False},
+            "x1": {"name": "x1", "host": "127.0.0.1", "port": 9003, "kemalg": "ML-KEM-768", "public_key": "cA==", "guard_eligible": False, "middle_eligible": True, "exit_eligible": True},
+        },
+    )
+
+    def _fake_build(path_of_relays, circuit_id=None):
+        assert [relay["name"] for relay in path_of_relays] == ["g1", "x1"]
+        return client.CircuitSession(
+            circuit_id=circuit_id or "cid-ordered",
+            guard_host="127.0.0.1",
+            guard_port=9001,
+            hops=[],
+        )
+
+    monkeypatch.setattr(cli, "build_circuit", _fake_build)
+
+    rc = cli.main(
+        [
+            "circuit",
+            "build",
+            "--directory-host",
+            "127.0.0.1",
+            "--allow-legacy-single-authority",
+            "--policy",
+            "first_valid",
+            "--relay-names",
+            "g1",
+            "x1",
+            "--session",
+            str(tmp_path / "session.json"),
+        ]
+    )
+
+    assert rc == 0
