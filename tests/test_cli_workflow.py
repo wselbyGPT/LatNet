@@ -259,6 +259,72 @@ def test_cli_circuit_build_from_verified_relays_with_policy_mode(tmp_path, latne
     assert rc == 0
 
 
+def test_cli_circuit_build_policy_passes_selection_tuning_and_seed(tmp_path, latnet_modules, monkeypatch):
+    cli = latnet_modules["cli"]
+    client = latnet_modules["client"]
+    observed: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        cli,
+        "fetch_verified_relays_from_directory",
+        lambda **_kwargs: {
+            "g1": {"name": "g1", "host": "127.0.0.1", "port": 9001, "kemalg": "ML-KEM-768", "public_key": "cA==", "guard_eligible": True, "middle_eligible": True, "exit_eligible": False},
+            "m1": {"name": "m1", "host": "127.0.0.1", "port": 9002, "kemalg": "ML-KEM-768", "public_key": "cA==", "guard_eligible": False, "middle_eligible": True, "exit_eligible": False},
+            "x1": {"name": "x1", "host": "127.0.0.1", "port": 9003, "kemalg": "ML-KEM-768", "public_key": "cA==", "guard_eligible": False, "middle_eligible": True, "exit_eligible": True},
+        },
+    )
+
+    def _fake_select_path(relays, policy, state):
+        observed["policy"] = policy
+        observed["state"] = state
+        return list(relays)[:3]
+
+    monkeypatch.setattr(cli, "select_path", _fake_select_path)
+    monkeypatch.setattr(
+        cli,
+        "build_circuit",
+        lambda path_of_relays, circuit_id=None: client.CircuitSession(
+            circuit_id=circuit_id or "cid-tuned",
+            guard_host="127.0.0.1",
+            guard_port=9001,
+            hops=[],
+        ),
+    )
+
+    rc = cli.main(
+        [
+            "circuit",
+            "build",
+            "--directory-host",
+            "127.0.0.1",
+            "--allow-legacy-single-authority",
+            "--policy",
+            "first_valid",
+            "--selection-seed",
+            "123",
+            "--guard-weight-multiplier",
+            "2.5",
+            "--middle-weight-multiplier",
+            "0.7",
+            "--exit-weight-multiplier",
+            "1.3",
+            "--min-reliability-cutoff",
+            "0.55",
+            "--session",
+            str(tmp_path / "session.json"),
+        ]
+    )
+
+    assert rc == 0
+    assert observed["policy"] == "first_valid"
+    state = observed["state"]
+    assert state["rng_seed"] == 123
+    assert state["policy_config"]["guard_weight_multiplier"] == 2.5
+    assert state["policy_config"]["middle_weight_multiplier"] == 0.7
+    assert state["policy_config"]["exit_weight_multiplier"] == 1.3
+    assert state["policy_config"]["min_reliability_cutoff"] == 0.55
+
+
 def test_cli_circuit_build_from_verified_relays_with_ordered_names(tmp_path, latnet_modules, monkeypatch):
     cli = latnet_modules["cli"]
     client = latnet_modules["client"]
