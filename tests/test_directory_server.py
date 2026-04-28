@@ -36,6 +36,106 @@ def test_get_bundle_success_path(tmp_path, latnet_modules):
         client_sock.close()
 
 
+def _network_status_doc(now: int) -> dict:
+    return {
+        "version": 1,
+        "snapshot": {"descriptors": []},
+        "snapshot_hash": "abc123",
+        "validity": {"valid_after": now - 5, "valid_until": now + 60},
+        "authority_set": [{"authority_id": "auth-1", "public_key": "ZmFrZS1rZXk="}],
+        "threshold": {"k": 1, "n": 1},
+        "votes": [{"authority_id": "auth-1", "signature": "ZmFrZS1zaWc=", "sigalg": "ed25519"}],
+    }
+
+
+def test_get_network_status_success_path(tmp_path, latnet_modules):
+    wire = latnet_modules["wire"]
+    directory_mod = latnet_modules["directory"]
+
+    now = int(time.time())
+    status_doc = _network_status_doc(now)
+    bundle_path = tmp_path / "bundle.json"
+    bundle_path.write_text('{"version":1,"descriptors":[]}', encoding="utf-8")
+    network_status_path = tmp_path / "network_status.json"
+    network_status_path.write_text(json.dumps(status_doc), encoding="utf-8")
+
+    server = directory_mod.DirectoryServer(str(bundle_path), network_status_path=str(network_status_path))
+    client_sock, server_sock = socket.socketpair()
+
+    try:
+        thread = _run_handle_conn(server, server_sock)
+        wire.send_msg(client_sock, {"type": "GET_NETWORK_STATUS"})
+        response = wire.recv_msg(client_sock)
+        thread.join(timeout=1)
+
+        assert response["ok"] is True
+        assert response["network_status"] == status_doc
+        assert response["status_version"] == 1
+        assert isinstance(response["server_time"], int)
+    finally:
+        client_sock.close()
+
+
+def test_get_network_status_missing_snapshot_returns_structured_error(tmp_path, latnet_modules):
+    wire = latnet_modules["wire"]
+    directory_mod = latnet_modules["directory"]
+
+    bundle_path = tmp_path / "bundle.json"
+    bundle_path.write_text('{"version":1,"descriptors":[]}', encoding="utf-8")
+
+    server = directory_mod.DirectoryServer(str(bundle_path))
+    client_sock, server_sock = socket.socketpair()
+    try:
+        thread = _run_handle_conn(server, server_sock)
+        wire.send_msg(client_sock, {"type": "GET_NETWORK_STATUS"})
+        response = wire.recv_msg(client_sock)
+        thread.join(timeout=1)
+
+        assert response["ok"] is False
+        assert response["error_class"] == "network_status_unavailable"
+        assert isinstance(response["server_time"], int)
+    finally:
+        client_sock.close()
+
+
+def test_get_network_status_rejects_malformed_or_expired(tmp_path, latnet_modules):
+    wire = latnet_modules["wire"]
+    directory_mod = latnet_modules["directory"]
+
+    bundle_path = tmp_path / "bundle.json"
+    bundle_path.write_text('{"version":1,"descriptors":[]}', encoding="utf-8")
+    network_status_path = tmp_path / "network_status.json"
+    network_status_path.write_text(json.dumps({"version": 1}), encoding="utf-8")
+    server = directory_mod.DirectoryServer(str(bundle_path), network_status_path=str(network_status_path))
+
+    client_sock, server_sock = socket.socketpair()
+    try:
+        thread = _run_handle_conn(server, server_sock)
+        wire.send_msg(client_sock, {"type": "GET_NETWORK_STATUS"})
+        malformed_response = wire.recv_msg(client_sock)
+        thread.join(timeout=1)
+        assert malformed_response["ok"] is False
+        assert malformed_response["error_class"] == "invalid_network_status"
+    finally:
+        client_sock.close()
+
+    expired_doc = _network_status_doc(int(time.time()))
+    expired_doc["validity"]["valid_until"] = int(time.time()) - 1
+    network_status_path.write_text(json.dumps(expired_doc), encoding="utf-8")
+
+    client_sock2, server_sock2 = socket.socketpair()
+    try:
+        thread2 = _run_handle_conn(server, server_sock2)
+        wire.send_msg(client_sock2, {"type": "GET_NETWORK_STATUS"})
+        expired_response = wire.recv_msg(client_sock2)
+        thread2.join(timeout=1)
+        assert expired_response["ok"] is False
+        assert expired_response["error_class"] == "expired_network_status"
+        assert expired_response["status_version"] == 1
+    finally:
+        client_sock2.close()
+
+
 def test_unknown_message_type_error_path(tmp_path, latnet_modules):
     wire = latnet_modules["wire"]
     directory_mod = latnet_modules["directory"]

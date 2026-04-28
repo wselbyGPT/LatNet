@@ -150,6 +150,21 @@ class PublishHSDescriptorResponse:
     error_class: str | None = None
 
 
+@dataclass(frozen=True)
+class GetNetworkStatusRequest:
+    type: Literal["GET_NETWORK_STATUS"]
+
+
+@dataclass(frozen=True)
+class GetNetworkStatusResponse:
+    ok: bool
+    network_status: dict[str, Any] | None = None
+    status_version: int | None = None
+    server_time: int | None = None
+    error: str | None = None
+    error_class: str | None = None
+
+
 def parse_build_envelope(obj: Any) -> BuildEnvelope:
     src = _as_dict(obj, context="BUILD envelope")
     if src.get("type") != "BUILD":
@@ -229,6 +244,36 @@ def parse_get_bundle_request(obj: Any) -> None:
     src = _as_dict(obj, context="directory request")
     if src.get("type") != "GET_BUNDLE":
         raise ValueError("unknown message type")
+
+
+def parse_get_network_status_request(obj: Any) -> GetNetworkStatusRequest:
+    src = _as_dict(obj, context="directory request")
+    if src.get("type") != "GET_NETWORK_STATUS":
+        raise ValueError("unknown message type")
+    return GetNetworkStatusRequest(type="GET_NETWORK_STATUS")
+
+
+def parse_get_network_status_response(obj: Any) -> GetNetworkStatusResponse:
+    src = _as_dict(obj, context="directory response")
+    ok = src.get("ok")
+    if not isinstance(ok, bool):
+        raise ValueError("missing or invalid field: ok")
+    status_version = _opt_int(src, "status_version")
+    server_time = _opt_int(src, "server_time")
+    if ok:
+        return GetNetworkStatusResponse(
+            ok=True,
+            network_status=_as_dict(src.get("network_status"), context="network_status"),
+            status_version=status_version,
+            server_time=server_time,
+        )
+    return GetNetworkStatusResponse(
+        ok=False,
+        error=_req_str(src, "error"),
+        error_class=_req_str(src, "error_class"),
+        status_version=status_version,
+        server_time=server_time,
+    )
 
 
 def parse_get_hidden_service_descriptor_request(obj: Any) -> str:

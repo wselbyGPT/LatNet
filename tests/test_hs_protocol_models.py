@@ -202,3 +202,21 @@ def test_publish_hs_descriptor_protocol_models_validate_fields(latnet_modules):
         {"ok": False, "error_class": "revision_conflict", "error": "bad revision"}
     )
     assert fail_response.error_class == "revision_conflict"
+
+
+def test_network_status_protocol_models_validate_fields(latnet_modules):
+    protocol = latnet_modules["models"]
+
+    request = protocol.parse_get_network_status_request({"type": "GET_NETWORK_STATUS"})
+    assert request.type == "GET_NETWORK_STATUS"
+
+    ok_response = protocol.parse_get_network_status_response(
+        {"ok": True, "network_status": {"version": 1}, "status_version": 1, "server_time": 123}
+    )
+    assert ok_response.ok is True
+    assert ok_response.status_version == 1
+
+    error_response = protocol.parse_get_network_status_response(
+        {"ok": False, "error_class": "network_status_unavailable", "error": "not found", "server_time": 123}
+    )
+    assert error_response.error_class == "network_status_unavailable"
