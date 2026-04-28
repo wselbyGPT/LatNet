@@ -41,6 +41,15 @@ from .protocol import (
     parse_stream_cell,
 )
 
+from .network_status import (
+    AuthorityMetadata,
+    AuthorityVote,
+    NetworkStatusDocument,
+    ThresholdPolicy,
+    ValidityInterval,
+    parse_network_status_document,
+)
+
 __all__ = [
     "HiddenServiceDescriptor",
     "IntroductionPoint",
@@ -76,4 +85,10 @@ __all__ = [
     "parse_publish_hidden_service_descriptor_request",
     "parse_publish_hidden_service_descriptor_response",
     "parse_stream_cell",
+    "AuthorityMetadata",
+    "AuthorityVote",
+    "NetworkStatusDocument",
+    "ThresholdPolicy",
+    "ValidityInterval",
+    "parse_network_status_document",
 ]
