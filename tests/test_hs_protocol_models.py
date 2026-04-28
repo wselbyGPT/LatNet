@@ -207,16 +207,37 @@ def test_publish_hs_descriptor_protocol_models_validate_fields(latnet_modules):
 def test_network_status_protocol_models_validate_fields(latnet_modules):
     protocol = latnet_modules["models"]
 
+    bundle_request = protocol.parse_get_bundle_request({"type": "GET_BUNDLE"})
+    assert bundle_request.protocol_version == protocol.TRUST_BUNDLE_PROTOCOL_VERSION
+
     request = protocol.parse_get_network_status_request({"type": "GET_NETWORK_STATUS"})
     assert request.type == "GET_NETWORK_STATUS"
+    assert request.protocol_version == protocol.TRUST_STATUS_PROTOCOL_VERSION
 
     ok_response = protocol.parse_get_network_status_response(
-        {"ok": True, "network_status": {"version": 1}, "status_version": 1, "server_time": 123}
+        {
+            "ok": True,
+            "network_status": {"version": 1},
+            "protocol_version": protocol.TRUST_STATUS_PROTOCOL_VERSION,
+            "status_version": 1,
+            "server_time": 123,
+        }
     )
     assert ok_response.ok is True
+    assert ok_response.protocol_version == protocol.TRUST_STATUS_PROTOCOL_VERSION
     assert ok_response.status_version == 1
 
     error_response = protocol.parse_get_network_status_response(
-        {"ok": False, "error_class": "network_status_unavailable", "error": "not found", "server_time": 123}
+        {
+            "ok": False,
+            "error_class": "network_status_unavailable",
+            "error": "not found",
+            "server_time": 123,
+        }
     )
     assert error_response.error_class == "network_status_unavailable"
+
+    with pytest.raises(ValueError, match="unsupported GET_NETWORK_STATUS protocol_version"):
+        protocol.parse_get_network_status_response(
+            {"ok": False, "protocol_version": 1, "error_class": "network_status_unavailable", "error": "not found"}
+        )

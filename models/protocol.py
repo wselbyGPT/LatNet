@@ -3,6 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Literal
 
+TRUST_BUNDLE_PROTOCOL_VERSION = 1
+TRUST_STATUS_PROTOCOL_VERSION = 2
+
 LayerCmd = Literal[
     "FORWARD_BUILD",
     "EXIT_READY",
@@ -151,14 +154,22 @@ class PublishHSDescriptorResponse:
 
 
 @dataclass(frozen=True)
+class GetBundleRequest:
+    type: Literal["GET_BUNDLE"]
+    protocol_version: int = TRUST_BUNDLE_PROTOCOL_VERSION
+
+
+@dataclass(frozen=True)
 class GetNetworkStatusRequest:
     type: Literal["GET_NETWORK_STATUS"]
+    protocol_version: int = TRUST_STATUS_PROTOCOL_VERSION
 
 
 @dataclass(frozen=True)
 class GetNetworkStatusResponse:
     ok: bool
     network_status: dict[str, Any] | None = None
+    protocol_version: int = TRUST_STATUS_PROTOCOL_VERSION
     status_version: int | None = None
     server_time: int | None = None
     error: str | None = None
@@ -240,17 +251,28 @@ def parse_exit_cell_layer(obj: Any) -> ExitCellLayer:
     return layer
 
 
-def parse_get_bundle_request(obj: Any) -> None:
+def parse_get_bundle_request(obj: Any) -> GetBundleRequest:
     src = _as_dict(obj, context="directory request")
     if src.get("type") != "GET_BUNDLE":
         raise ValueError("unknown message type")
+    protocol_version = _opt_int(src, "protocol_version")
+    if protocol_version is None:
+        protocol_version = TRUST_BUNDLE_PROTOCOL_VERSION
+    if protocol_version != TRUST_BUNDLE_PROTOCOL_VERSION:
+        raise ValueError("unsupported GET_BUNDLE protocol_version")
+    return GetBundleRequest(type="GET_BUNDLE", protocol_version=protocol_version)
 
 
 def parse_get_network_status_request(obj: Any) -> GetNetworkStatusRequest:
     src = _as_dict(obj, context="directory request")
     if src.get("type") != "GET_NETWORK_STATUS":
         raise ValueError("unknown message type")
-    return GetNetworkStatusRequest(type="GET_NETWORK_STATUS")
+    protocol_version = _opt_int(src, "protocol_version")
+    if protocol_version is None:
+        protocol_version = TRUST_STATUS_PROTOCOL_VERSION
+    if protocol_version != TRUST_STATUS_PROTOCOL_VERSION:
+        raise ValueError("unsupported GET_NETWORK_STATUS protocol_version")
+    return GetNetworkStatusRequest(type="GET_NETWORK_STATUS", protocol_version=protocol_version)
 
 
 def parse_get_network_status_response(obj: Any) -> GetNetworkStatusResponse:
@@ -258,12 +280,18 @@ def parse_get_network_status_response(obj: Any) -> GetNetworkStatusResponse:
     ok = src.get("ok")
     if not isinstance(ok, bool):
         raise ValueError("missing or invalid field: ok")
+    protocol_version = _opt_int(src, "protocol_version")
+    if protocol_version is None:
+        protocol_version = TRUST_STATUS_PROTOCOL_VERSION
+    if protocol_version != TRUST_STATUS_PROTOCOL_VERSION:
+        raise ValueError("unsupported GET_NETWORK_STATUS protocol_version")
     status_version = _opt_int(src, "status_version")
     server_time = _opt_int(src, "server_time")
     if ok:
         return GetNetworkStatusResponse(
             ok=True,
             network_status=_as_dict(src.get("network_status"), context="network_status"),
+            protocol_version=protocol_version,
             status_version=status_version,
             server_time=server_time,
         )
@@ -271,6 +299,7 @@ def parse_get_network_status_response(obj: Any) -> GetNetworkStatusResponse:
         ok=False,
         error=_req_str(src, "error"),
         error_class=_req_str(src, "error_class"),
+        protocol_version=protocol_version,
         status_version=status_version,
         server_time=server_time,
     )

@@ -1,5 +1,44 @@
 # Protocol notes
 
+## Directory trust protocol versions
+
+Directory trust transport has two protocol modes:
+
+- **Legacy mode**: `GET_BUNDLE` returning a legacy authority bundle (**bundle v1**).
+- **Consensus mode**: `GET_NETWORK_STATUS` returning signed threshold consensus (**status v2**).
+
+### Version markers
+
+Clients and servers use explicit trust protocol markers on trust-related directory messages:
+
+- `GET_BUNDLE` request uses `protocol_version = 1` (`TRUST_BUNDLE_PROTOCOL_VERSION`).
+- `GET_NETWORK_STATUS` request/response use `protocol_version = 2` (`TRUST_STATUS_PROTOCOL_VERSION`).
+
+For compatibility during rollout, parsers currently treat omitted `protocol_version` as the command default (`1` for `GET_BUNDLE`, `2` for `GET_NETWORK_STATUS`).
+
+### Client behavior matrix
+
+| Client trust config present | Primary request | Expected mode | Fallback to legacy v1 |
+| --- | --- | --- | --- |
+| Yes (`trusted_authorities`, `min_signers`) | `GET_NETWORK_STATUS` | status v2 | **No** (fail closed) |
+| No, but explicit legacy opt-in (`allow_legacy_single_authority = true`) | `GET_BUNDLE` | bundle v1 | N/A (already legacy path) |
+| No trust config and no legacy opt-in | none | reject locally | none |
+
+Recommended behavior:
+
+1. Prefer `GET_NETWORK_STATUS` (v2) whenever trust config is available.
+2. Only use `GET_BUNDLE` (v1) under explicit, controlled operator opt-in.
+3. Treat v2 trust-validation failures as hard failures (do not silently downgrade to v1).
+
+### Trust failure error classes
+
+Directory/client trust verification should normalize failures into structured `error_class` values:
+
+- `insufficient_quorum`: not enough trusted authority votes/signatures to satisfy threshold policy.
+- `expired_status`: network status validity interval has elapsed.
+- `unknown_authority`: signer identity is not in the trusted authority set.
+- `invalid_signature_set`: malformed/duplicate/inconsistent signatures or signer key material mismatch.
+
 ## Stream sequence numbers (`seq`)
 
 Exit relays apply sequence validation independently per `(circuit_id, stream_id)`.
@@ -40,4 +79,3 @@ Runtime summary metrics are emitted in the `metrics` field on shutdown events, i
 ## Operations documentation
 
 - `docs/operator_playbook.md` is the primary operator runbook for hidden service bootstrap, publish/rotation, troubleshooting, and alert thresholds.
-

@@ -24,6 +24,7 @@ from .protocol import (
     ExitReadyLayer,
     ForwardBuildLayer,
     ForwardCellLayer,
+    GetBundleRequest,
     GetNetworkStatusRequest,
     GetNetworkStatusResponse,
     NextHop,
@@ -43,6 +44,8 @@ from .protocol import (
     parse_publish_hidden_service_descriptor_request,
     parse_publish_hidden_service_descriptor_response,
     parse_stream_cell,
+    TRUST_BUNDLE_PROTOCOL_VERSION,
+    TRUST_STATUS_PROTOCOL_VERSION,
 )
 
 from .network_status import (
@@ -74,6 +77,7 @@ __all__ = [
     "ExitReadyLayer",
     "ForwardBuildLayer",
     "ForwardCellLayer",
+    "GetBundleRequest",
     "GetNetworkStatusRequest",
     "GetNetworkStatusResponse",
     "NextHop",
@@ -93,6 +97,8 @@ __all__ = [
     "parse_publish_hidden_service_descriptor_request",
     "parse_publish_hidden_service_descriptor_response",
     "parse_stream_cell",
+    "TRUST_BUNDLE_PROTOCOL_VERSION",
+    "TRUST_STATUS_PROTOCOL_VERSION",
     "AuthorityMetadata",
     "AuthorityVote",
     "NetworkStatusDocument",
