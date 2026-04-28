@@ -7,9 +7,11 @@ from typing import Any
 
 from .models.hidden_service import parse_lettuce_name
 from .models.hidden_service_descriptor import verify_hidden_service_descriptor_v2
+from .models.network_status import parse_network_status_document
 from .models.protocol import (
     parse_get_bundle_request,
     parse_get_hidden_service_descriptor_request,
+    parse_get_network_status_request,
     parse_publish_hidden_service_descriptor_request,
 )
 from .util import atomic_write_json, load_json
@@ -17,12 +19,25 @@ from . import wire
 
 
 class DirectoryServer:
-    def __init__(self, bundle_path: str, hidden_service_store_path: str | None = None):
+    def __init__(
+        self,
+        bundle_path: str,
+        hidden_service_store_path: str | None = None,
+        network_status_path: str | None = None,
+    ):
         self.bundle_path = Path(bundle_path)
         self.hidden_service_store_path = Path(hidden_service_store_path) if hidden_service_store_path else None
+        self.network_status_path = Path(network_status_path) if network_status_path else None
 
     def current_bundle(self) -> dict[str, Any]:
         return load_json(self.bundle_path)
+
+    def current_network_status(self) -> dict[str, Any]:
+        if self.network_status_path is None:
+            raise FileNotFoundError("network-status snapshot path not configured")
+        network_status = load_json(self.network_status_path)
+        parse_network_status_document(network_status)
+        return network_status
 
     def hidden_service_store(self) -> dict[str, Any]:
         if self.hidden_service_store_path is None:
@@ -66,6 +81,82 @@ class DirectoryServer:
             if msg.get("type") == "GET_BUNDLE":
                 parse_get_bundle_request(msg)
                 wire.send_msg(conn, {"ok": True, "bundle": self.current_bundle()})
+            elif msg.get("type") == "GET_NETWORK_STATUS":
+                parse_get_network_status_request(msg)
+                now = int(time.time())
+                try:
+                    network_status = self.current_network_status()
+                except FileNotFoundError as exc:
+                    wire.send_msg(
+                        conn,
+                        {
+                            "ok": False,
+                            "error_class": "network_status_unavailable",
+                            "error": str(exc),
+                            "server_time": now,
+                        },
+                    )
+                    return
+                except Exception as exc:
+                    wire.send_msg(
+                        conn,
+                        {
+                            "ok": False,
+                            "error_class": "invalid_network_status",
+                            "error": str(exc),
+                            "server_time": now,
+                        },
+                    )
+                    return
+
+                validity = network_status.get("validity", {})
+                valid_after = validity.get("valid_after")
+                valid_until = validity.get("valid_until")
+                if not isinstance(valid_after, int) or not isinstance(valid_until, int):
+                    wire.send_msg(
+                        conn,
+                        {
+                            "ok": False,
+                            "error_class": "invalid_network_status",
+                            "error": "network status validity interval is malformed",
+                            "status_version": network_status.get("version"),
+                            "server_time": now,
+                        },
+                    )
+                    return
+                if now < valid_after:
+                    wire.send_msg(
+                        conn,
+                        {
+                            "ok": False,
+                            "error_class": "premature_network_status",
+                            "error": "network status snapshot is not yet valid",
+                            "status_version": network_status.get("version"),
+                            "server_time": now,
+                        },
+                    )
+                    return
+                if now >= valid_until:
+                    wire.send_msg(
+                        conn,
+                        {
+                            "ok": False,
+                            "error_class": "expired_network_status",
+                            "error": "network status snapshot is expired",
+                            "status_version": network_status.get("version"),
+                            "server_time": now,
+                        },
+                    )
+                    return
+                wire.send_msg(
+                    conn,
+                    {
+                        "ok": True,
+                        "network_status": network_status,
+                        "status_version": network_status.get("version"),
+                        "server_time": now,
+                    },
+                )
             elif msg.get("type") == "GET_HS_DESCRIPTOR":
                 service_name = parse_get_hidden_service_descriptor_request(msg)
                 parse_lettuce_name(service_name)
@@ -196,10 +287,16 @@ def run_directory_server(
     host: str = "127.0.0.1",
     port: int = 9200,
     hidden_service_store_path: str | None = None,
+    network_status_path: str | None = None,
 ) -> None:
-    server = DirectoryServer(bundle_path, hidden_service_store_path=hidden_service_store_path)
+    server = DirectoryServer(
+        bundle_path,
+        hidden_service_store_path=hidden_service_store_path,
+        network_status_path=network_status_path,
+    )
     hs_msg = f" and hidden service store {hidden_service_store_path}" if hidden_service_store_path else ""
-    print(f"Starting directory server on {host}:{port} serving {bundle_path}{hs_msg}")
+    ns_msg = f" and network status {network_status_path}" if network_status_path else ""
+    print(f"Starting directory server on {host}:{port} serving {bundle_path}{hs_msg}{ns_msg}")
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as srv:
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
