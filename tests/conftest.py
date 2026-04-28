@@ -130,6 +130,10 @@ def latnet_modules():
     models_pkg = types.ModuleType(models_pkg_name)
     models_pkg.__path__ = [str(REPO_ROOT / "models")]
     sys.modules[models_pkg_name] = models_pkg
+    selection_pkg_name = f"{pkg_name}.selection"
+    selection_pkg = types.ModuleType(selection_pkg_name)
+    selection_pkg.__path__ = [str(REPO_ROOT / "selection")]
+    sys.modules[selection_pkg_name] = selection_pkg
 
     _install_cryptography_stub()
 
@@ -146,6 +150,7 @@ def latnet_modules():
     directory = _load_module("latnet.directory", REPO_ROOT / "directory.py")
     client = _load_module("latnet.client", REPO_ROOT / "client.py")
     relay = _load_module("latnet.relay", REPO_ROOT / "relay.py")
+    selection_policy = _load_module("latnet.selection.policy", REPO_ROOT / "selection" / "policy.py")
     observability = _load_module("latnet.observability", REPO_ROOT / "observability.py")
     cli = _load_module("latnet.cli", REPO_ROOT / "cli.py")
     hidden_service_runtime = _load_module("latnet.hidden_service_runtime", REPO_ROOT / "hidden_service_runtime.py")
@@ -164,6 +169,7 @@ def latnet_modules():
         "directory": directory,
         "client": client,
         "relay": relay,
+        "selection.policy": selection_policy,
         "observability": observability,
         "cli": cli,
         "hidden_service_runtime": hidden_service_runtime,

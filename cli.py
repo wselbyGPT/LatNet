@@ -51,6 +51,7 @@ from .hidden_service_runtime import (
 from .relay import RelayServer, init_relay_file, run_relay_server
 from .observability import EventEmitter, Metrics
 from .util import atomic_write_json, b64d, b64e, load_json
+from .selection.policy import select_path
 
 
 def _load_relays(paths: list[str]) -> list[dict[str, Any]]:
@@ -172,6 +173,8 @@ def _build_parser() -> argparse.ArgumentParser:
     circuit_build.add_argument("--directory-host", default=None, help="Directory host for verified relay discovery")
     circuit_build.add_argument("--directory-port", type=int, default=9200, help="Directory port for verified relay discovery")
     circuit_build.add_argument("--relay-names", nargs="+", default=None, help="Relay names from verified snapshot in guard->exit order")
+    circuit_build.add_argument("--policy", choices=["ordered", "first_valid"], default="ordered", help="Path selection policy for verified relays")
+    circuit_build.add_argument("--middle-count", type=int, default=1, help="Number of middle hops when using policy selection mode")
     circuit_build.add_argument("--trust-config", default=None, help="Trust config JSON file path")
     circuit_build.add_argument("--trusted-authority", action="append", default=[], help="Trusted authority as authority_id=public_key")
     circuit_build.add_argument("--min-signers", type=int, default=None, help="Threshold min_signers policy override")
@@ -313,19 +316,26 @@ def main(argv: list[str] | None = None) -> int:
                 trust=trust,
                 allow_legacy_single_authority=bool(args.allow_legacy_single_authority),
             )
-            if not args.relay_names:
-                raise ValueError("--relay-names is required when using --directory-host")
-            selected_relays = []
-            for name in args.relay_names:
-                relay = verified_relays.get(name)
-                if relay is None:
-                    raise ValueError(f"relay {name} missing from verified snapshot")
-                selected_relays.append(relay)
+            candidate_relays = list(verified_relays.values())
+            policy = args.policy
+            if args.relay_names:
+                policy = "ordered"
+            selection_state = {
+                "relay_names": args.relay_names,
+                "middle_count": args.middle_count,
+            }
+            selected_relays = select_path(candidate_relays, policy=policy, state=selection_state)
             circuit = build_circuit(selected_relays, circuit_id=args.circuit_id)
         else:
             if not args.relays:
-                raise ValueError("provide relay descriptors or --directory-host with --relay-names")
-            circuit = build_circuit(_load_relays(args.relays), circuit_id=args.circuit_id)
+                raise ValueError("provide relay descriptors or --directory-host")
+            selected_relays = _load_relays(args.relays)
+            selected_relays = select_path(
+                selected_relays,
+                policy="ordered",
+                state={"relay_names": [str(relay.get("name", "")) for relay in selected_relays]},
+            )
+            circuit = build_circuit(selected_relays, circuit_id=args.circuit_id)
         _save_session(args.session, circuit)
         _print_json({"ok": True, "session": str(Path(args.session)), "circuit_id": circuit.circuit_id})
         return 0
