@@ -80,7 +80,20 @@ def test_cli_hs_connect_send_recv_roundtrip(tmp_path, latnet_modules, monkeypatc
     monkeypatch.setattr(cli, "rendezvous_send", lambda *_args, **_kwargs: {"cmd": "RENDEZVOUS_RELAYED"})
     monkeypatch.setattr(cli, "rendezvous_recv", lambda *_args, **_kwargs: "hello-back")
 
-    assert cli.main(["hs", "connect", service_name, str(relay_path), "--session", str(session_path)]) == 0
+    assert (
+        cli.main(
+            [
+                "hs",
+                "connect",
+                service_name,
+                str(relay_path),
+                "--session",
+                str(session_path),
+                "--allow-legacy-single-authority",
+            ]
+        )
+        == 0
+    )
     assert cli.main(["hs", "send", "--session", str(session_path), "hello"]) == 0
     assert cli.main(["hs", "recv", "--session", str(session_path)]) == 0
 

@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import time
 import uuid
+import os
+import json
 from dataclasses import dataclass, field
 from typing import Any
 
 import oqs
 
+from .authority import verify_network_status
 from .constants import DEFAULT_TIMEOUT
 from .crypto import decrypt_layer, derive_hop_keys, encrypt_layer
 from .models.hidden_service import parse_lettuce_name
@@ -15,7 +18,7 @@ from .models.protocol import (
     parse_publish_hidden_service_descriptor_request,
     parse_publish_hidden_service_descriptor_response,
 )
-from .util import atomic_write_json, b64d, b64e
+from .util import atomic_write_json, b64d, b64e, load_json
 from .wire import recv_msg, send_msg
 
 NO_DESCRIPTOR_ERROR = "no descriptor available for hidden service"
@@ -61,6 +64,12 @@ class CircuitSession:
     stream_next_seq: dict[int, int] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class ClientTrustConfig:
+    trusted_authorities: list[dict[str, str]]
+    min_signers: int
+    authority_set_version: int | None = None
+
 
 def fetch_bundle_from_directory(host: str, port: int = 9200) -> dict[str, Any]:
     import socket
@@ -77,6 +86,149 @@ def fetch_bundle_from_directory(host: str, port: int = 9200) -> dict[str, Any]:
     if not isinstance(bundle, dict):
         raise ValueError("directory response missing bundle")
     return bundle
+
+
+def fetch_network_status_from_directory(host: str, port: int = 9200) -> dict[str, Any]:
+    import socket
+
+    with socket.create_connection((host, port), timeout=DEFAULT_TIMEOUT) as sock:
+        send_msg(sock, {"type": "GET_NETWORK_STATUS"})
+        response = recv_msg(sock)
+
+    if not isinstance(response, dict):
+        raise ValueError("directory response must be an object")
+    if not response.get("ok"):
+        raise ValueError(response.get("error", "directory returned error"))
+    status = response.get("network_status")
+    if not isinstance(status, dict):
+        raise ValueError("directory response missing network_status")
+    return status
+
+
+def load_client_trust_config(
+    *,
+    trust_config_path: str | None = None,
+    trusted_authorities: list[dict[str, str]] | None = None,
+    min_signers: int | None = None,
+    authority_set_version: int | None = None,
+) -> ClientTrustConfig:
+    env_path = os.getenv("LATNET_TRUST_CONFIG")
+    chosen_path = trust_config_path or env_path
+    file_config: dict[str, Any] = {}
+    if chosen_path:
+        file_config = load_json(chosen_path)
+        if not isinstance(file_config, dict):
+            raise ValueError("trust config file must be a JSON object")
+
+    env_authorities_raw = os.getenv("LATNET_TRUSTED_AUTHORITIES")
+    env_authorities: list[dict[str, str]] | None = None
+    if env_authorities_raw:
+        parsed = json.loads(env_authorities_raw)
+        if not isinstance(parsed, list):
+            raise ValueError("LATNET_TRUSTED_AUTHORITIES must be a JSON list")
+        env_authorities = parsed
+
+    merged_authorities = trusted_authorities or env_authorities or file_config.get("trusted_authorities")
+    if not isinstance(merged_authorities, list) or not merged_authorities:
+        raise ValueError("trust config requires trusted_authorities list")
+
+    normalized_authorities: list[dict[str, str]] = []
+    seen_ids: set[str] = set()
+    for item in merged_authorities:
+        if not isinstance(item, dict):
+            raise ValueError("trusted authority entries must be objects")
+        authority_id = item.get("authority_id") or item.get("key_id")
+        public_key = item.get("public_key")
+        if not isinstance(authority_id, str) or not authority_id:
+            raise ValueError("trusted authority missing authority_id")
+        if authority_id in seen_ids:
+            raise ValueError(f"duplicate trusted authority id: {authority_id}")
+        seen_ids.add(authority_id)
+        if not isinstance(public_key, str) or not public_key:
+            raise ValueError(f"trusted authority missing public_key for {authority_id}")
+        normalized_authorities.append({"authority_id": authority_id, "public_key": public_key})
+
+    env_min_signers = os.getenv("LATNET_MIN_SIGNERS")
+    effective_min_signers = min_signers
+    if effective_min_signers is None and env_min_signers is not None:
+        effective_min_signers = int(env_min_signers)
+    if effective_min_signers is None:
+        effective_min_signers = file_config.get("min_signers")
+    if not isinstance(effective_min_signers, int) or effective_min_signers <= 0:
+        raise ValueError("trust config requires positive min_signers")
+    if effective_min_signers > len(normalized_authorities):
+        raise ValueError("min_signers cannot exceed trusted authority count")
+
+    env_authority_set_version = os.getenv("LATNET_AUTHORITY_SET_VERSION")
+    effective_set_version = authority_set_version
+    if effective_set_version is None and env_authority_set_version is not None:
+        effective_set_version = int(env_authority_set_version)
+    if effective_set_version is None:
+        file_value = file_config.get("authority_set_version")
+        if file_value is None:
+            file_value = file_config.get("authority_set_epoch")
+        effective_set_version = file_value
+    if effective_set_version is not None and not isinstance(effective_set_version, int):
+        raise ValueError("authority_set_version must be an integer when provided")
+
+    return ClientTrustConfig(
+        trusted_authorities=normalized_authorities,
+        min_signers=effective_min_signers,
+        authority_set_version=effective_set_version,
+    )
+
+
+def verified_relays_from_network_status(
+    network_status: dict[str, Any],
+    trust: ClientTrustConfig,
+    *,
+    now: int | None = None,
+) -> dict[str, dict[str, Any]]:
+    if trust.authority_set_version is not None:
+        declared_version = network_status.get("authority_set_version")
+        if declared_version is None:
+            declared_version = network_status.get("authority_set_epoch")
+        if declared_version != trust.authority_set_version:
+            raise ValueError(
+                "network status authority set version mismatch: "
+                f"expected={trust.authority_set_version} got={declared_version}"
+            )
+
+    return verify_network_status(
+        network_status,
+        trusted_authorities=[
+            {"key_id": item["authority_id"], "public_key": item["public_key"]} for item in trust.trusted_authorities
+        ],
+        threshold_policy={"k": trust.min_signers, "n": len(trust.trusted_authorities)},
+        now=now,
+    )
+
+
+def fetch_verified_relays_from_directory(
+    host: str,
+    *,
+    port: int = 9200,
+    trust: ClientTrustConfig | None = None,
+    allow_legacy_single_authority: bool = False,
+    now: int | None = None,
+) -> dict[str, dict[str, Any]]:
+    if trust is None:
+        if not allow_legacy_single_authority:
+            raise ValueError("trust config is required for verified directory relay fetch")
+        bundle = fetch_bundle_from_directory(host=host, port=port)
+        descriptors = bundle.get("descriptors")
+        if not isinstance(descriptors, list):
+            raise ValueError("legacy bundle descriptors must be a list")
+        return {
+            descriptor["signed"]["relay"]["name"]: descriptor["signed"]["relay"]
+            for descriptor in descriptors
+            if isinstance(descriptor, dict) and isinstance(descriptor.get("signed"), dict)
+            and isinstance(descriptor["signed"].get("relay"), dict)
+            and isinstance(descriptor["signed"]["relay"].get("name"), str)
+        }
+
+    network_status = fetch_network_status_from_directory(host=host, port=port)
+    return verified_relays_from_network_status(network_status, trust, now=now)
 
 
 
@@ -423,8 +575,13 @@ def demo_circuit_echo(
 
 
 __all__ = [
+    "ClientTrustConfig",
     "fetch_bundle_from_directory",
     "fetch_bundle_to_file",
+    "fetch_network_status_from_directory",
+    "load_client_trust_config",
+    "verified_relays_from_network_status",
+    "fetch_verified_relays_from_directory",
     "fetch_hidden_service_descriptor_from_directory",
     "order_intro_points_for_phase1",
     "select_intro_point_for_phase1",

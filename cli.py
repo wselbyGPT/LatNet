@@ -14,6 +14,7 @@ from .authority import (
     sign_relay_file,
 )
 from .client import (
+    ClientTrustConfig,
     CircuitSession,
     HopSession,
     NO_DESCRIPTOR_ERROR,
@@ -23,6 +24,8 @@ from .client import (
     fetch_bundle_from_directory,
     fetch_bundle_to_file,
     fetch_hidden_service_descriptor_from_directory,
+    fetch_verified_relays_from_directory,
+    load_client_trust_config,
     publish_hidden_service_descriptor_to_directory,
     open_stream,
     send_stream_data,
@@ -163,9 +166,17 @@ def _build_parser() -> argparse.ArgumentParser:
     circuit_sub = circuit.add_subparsers(dest="circuit_cmd", required=True)
 
     circuit_build = circuit_sub.add_parser("build", help="Build a circuit and persist its session")
-    circuit_build.add_argument("relays", nargs="+", help="Relay descriptor JSON paths in guard->exit order")
+    circuit_build.add_argument("relays", nargs="*", help="Relay descriptor JSON paths in guard->exit order")
     circuit_build.add_argument("--session", default=".latnet-circuit.json", help="Circuit session output file")
     circuit_build.add_argument("--circuit-id", default=None, help="Optional circuit ID override")
+    circuit_build.add_argument("--directory-host", default=None, help="Directory host for verified relay discovery")
+    circuit_build.add_argument("--directory-port", type=int, default=9200, help="Directory port for verified relay discovery")
+    circuit_build.add_argument("--relay-names", nargs="+", default=None, help="Relay names from verified snapshot in guard->exit order")
+    circuit_build.add_argument("--trust-config", default=None, help="Trust config JSON file path")
+    circuit_build.add_argument("--trusted-authority", action="append", default=[], help="Trusted authority as authority_id=public_key")
+    circuit_build.add_argument("--min-signers", type=int, default=None, help="Threshold min_signers policy override")
+    circuit_build.add_argument("--authority-set-version", type=int, default=None, help="Optional authority set epoch/version")
+    circuit_build.add_argument("--allow-legacy-single-authority", action="store_true", help="Lab-only escape hatch for unsigned legacy bundle")
 
     circuit_destroy = circuit_sub.add_parser("destroy", help="Destroy a persisted circuit")
     circuit_destroy.add_argument("--session", default=".latnet-circuit.json", help="Circuit session file")
@@ -214,6 +225,11 @@ def _build_parser() -> argparse.ArgumentParser:
     hs_connect.add_argument("--host", default="127.0.0.1", help="Directory host")
     hs_connect.add_argument("--port", type=int, default=9200, help="Directory port")
     hs_connect.add_argument("--session", default=".latnet-hs.json", help="HS session output file")
+    hs_connect.add_argument("--trust-config", default=None, help="Trust config JSON file path")
+    hs_connect.add_argument("--trusted-authority", action="append", default=[], help="Trusted authority as authority_id=public_key")
+    hs_connect.add_argument("--min-signers", type=int, default=None, help="Threshold min_signers policy override")
+    hs_connect.add_argument("--authority-set-version", type=int, default=None, help="Optional authority set epoch/version")
+    hs_connect.add_argument("--allow-legacy-single-authority", action="store_true", help="Lab-only escape hatch for unsigned legacy bundle")
 
     hs_send = hs_sub.add_parser("send", help="Relay a message payload over persisted HS session")
     hs_send.add_argument("--session", default=".latnet-hs.json", help="HS session file")
@@ -264,8 +280,52 @@ def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
 
+    def _parse_authority_flags(values: list[str]) -> list[dict[str, str]]:
+        authorities: list[dict[str, str]] = []
+        for item in values:
+            authority_id, sep, public_key = item.partition("=")
+            if not sep or not authority_id or not public_key:
+                raise ValueError("trusted authority must use authority_id=public_key")
+            authorities.append({"authority_id": authority_id, "public_key": public_key})
+        return authorities
+
+    def _trust_from_args(ns: argparse.Namespace) -> ClientTrustConfig | None:
+        trusted = _parse_authority_flags(getattr(ns, "trusted_authority", []))
+        has_explicit = bool(trusted) or getattr(ns, "trust_config", None) or getattr(ns, "min_signers", None) is not None
+        has_explicit = has_explicit or getattr(ns, "authority_set_version", None) is not None
+        if not has_explicit and not getattr(ns, "allow_legacy_single_authority", False):
+            return load_client_trust_config()
+        if not has_explicit:
+            return None
+        return load_client_trust_config(
+            trust_config_path=getattr(ns, "trust_config", None),
+            trusted_authorities=trusted or None,
+            min_signers=getattr(ns, "min_signers", None),
+            authority_set_version=getattr(ns, "authority_set_version", None),
+        )
+
     if args.top_cmd == "circuit" and args.circuit_cmd == "build":
-        circuit = build_circuit(_load_relays(args.relays), circuit_id=args.circuit_id)
+        if args.directory_host:
+            trust = _trust_from_args(args)
+            verified_relays = fetch_verified_relays_from_directory(
+                host=args.directory_host,
+                port=args.directory_port,
+                trust=trust,
+                allow_legacy_single_authority=bool(args.allow_legacy_single_authority),
+            )
+            if not args.relay_names:
+                raise ValueError("--relay-names is required when using --directory-host")
+            selected_relays = []
+            for name in args.relay_names:
+                relay = verified_relays.get(name)
+                if relay is None:
+                    raise ValueError(f"relay {name} missing from verified snapshot")
+                selected_relays.append(relay)
+            circuit = build_circuit(selected_relays, circuit_id=args.circuit_id)
+        else:
+            if not args.relays:
+                raise ValueError("provide relay descriptors or --directory-host with --relay-names")
+            circuit = build_circuit(_load_relays(args.relays), circuit_id=args.circuit_id)
         _save_session(args.session, circuit)
         _print_json({"ok": True, "session": str(Path(args.session)), "circuit_id": circuit.circuit_id})
         return 0
@@ -349,6 +409,14 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.top_cmd == "hs" and args.hs_cmd == "connect":
         metrics = Metrics()
+        verified_relays = None
+        trust = _trust_from_args(args)
+        if trust is not None:
+            verified_relays = fetch_verified_relays_from_directory(
+                host=args.host,
+                port=args.port,
+                trust=trust,
+            )
         descriptor = fetch_hidden_service_descriptor_from_directory(
             host=args.host,
             port=args.port,
@@ -358,12 +426,23 @@ def main(argv: list[str] | None = None) -> int:
         relay_doc = load_json(args.relay)
         rendezvous_cookie = uuid.uuid4().hex
 
+        if verified_relays is not None:
+            relay_name = str(relay_doc.get("name"))
+            verified_rdv = verified_relays.get(relay_name)
+            if verified_rdv is None:
+                raise ValueError(f"rendezvous relay {relay_name} missing from verified snapshot")
+            relay_doc = verified_rdv
+            intro_name = str(intro["relay_name"])
+            verified_intro = verified_relays.get(intro_name)
+            if verified_intro is None:
+                raise ValueError(f"introduction relay {intro_name} missing from verified snapshot")
+
         intro_relay = {
             "name": intro["relay_name"],
-            "host": intro["relay_addr"]["host"],
-            "port": intro["relay_addr"]["port"],
-            "kemalg": relay_doc["kemalg"],
-            "public_key": relay_doc["public_key"],
+            "host": verified_intro["host"] if verified_relays is not None else intro["relay_addr"]["host"],
+            "port": verified_intro["port"] if verified_relays is not None else intro["relay_addr"]["port"],
+            "kemalg": verified_intro["kemalg"] if verified_relays is not None else relay_doc["kemalg"],
+            "public_key": verified_intro["public_key"] if verified_relays is not None else relay_doc["public_key"],
         }
 
         intro_circuit = build_service_circuit([intro_relay], terminal_cmd="INTRO_READY")

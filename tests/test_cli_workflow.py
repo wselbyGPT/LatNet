@@ -159,14 +159,25 @@ def test_cli_hs_connect_persists_session(tmp_path, latnet_modules, monkeypatch, 
     runtime = latnet_modules["hidden_service_runtime"]
     monkeypatch.setattr(runtime, "_send_circuit_cmd", lambda *_args, **_kwargs: {"cmd": "ok"})
 
-    rc = cli.main(["hs", "connect", service_name, str(relay_path), "--session", str(session_path)])
+    rc = cli.main(
+        [
+            "hs",
+            "connect",
+            service_name,
+            str(relay_path),
+            "--session",
+            str(session_path),
+            "--allow-legacy-single-authority",
+        ]
+    )
 
     assert rc == 0
     session_json = json.loads(session_path.read_text())
     assert session_json["service_name"] == service_name
     assert session_json["mode"] == "client"
-    output = json.loads(capsys.readouterr().out)
-    assert output["ok"] is True
+    output = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert output["event"] == "hs.runtime_stopped"
+    assert output["status"] == "ok"
 
 
 def test_cli_hs_send_and_end_use_session(tmp_path, latnet_modules, monkeypatch, capsys):
@@ -191,6 +202,7 @@ def test_cli_hs_send_and_end_use_session(tmp_path, latnet_modules, monkeypatch, 
     )
 
     monkeypatch.setattr(cli, "rendezvous_send", lambda *_args, **_kwargs: {"cmd": "RENDEZVOUS_RELAYED"})
+    monkeypatch.setattr(cli, "rendezvous_close", lambda *_args, **_kwargs: {"cmd": "RENDEZVOUS_RELAYED"})
 
     rc_send = cli.main(["hs", "send", "--session", str(session_path), "hello"])
     rc_end = cli.main(["hs", "end", "--session", str(session_path), "--payload", "done"])
