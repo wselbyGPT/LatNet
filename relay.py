@@ -48,6 +48,9 @@ class RelayServer:
         outbound_connect_timeout: float = DEFAULT_TIMEOUT,
         outbound_recv_timeout: float = DEFAULT_TIMEOUT,
         exit_policy: ExitPolicy | None = None,
+        stream_queue_high_water_bytes: int = 64 * 1024,
+        stream_queue_low_water_bytes: int = 16 * 1024,
+        connector_io_timeout_seconds: float = 0.25,
     ):
         self.relay_doc = relay_doc
         self.circuits: dict[str, dict[str, Any]] = {}
@@ -61,6 +64,9 @@ class RelayServer:
         self.pending_introductions: dict[str, dict[str, Any]] = {}
         self.pending_rendezvous: dict[str, dict[str, Any]] = {}
         self.rendezvous_links: dict[str, dict[str, Any]] = {}
+        self.stream_queue_high_water_bytes = max(int(stream_queue_high_water_bytes), 1024)
+        self.stream_queue_low_water_bytes = min(max(int(stream_queue_low_water_bytes), 0), self.stream_queue_high_water_bytes)
+        self.connector_io_timeout_seconds = max(float(connector_io_timeout_seconds), 0.01)
         self.outbound_connector = outbound_connector or (
             PolicyEnforcedTcpConnector(connect_timeout=outbound_connect_timeout, recv_timeout=outbound_recv_timeout, policy=exit_policy)
             if enable_real_egress
@@ -150,6 +156,64 @@ class RelayServer:
             )
         return None
 
+
+
+    @staticmethod
+    def _stream_metrics_template() -> dict[str, Any]:
+        return {
+            "queue_depth_samples": 0,
+            "queue_depth_sum": 0,
+            "queue_depth_max": 0,
+            "throttled_events": 0,
+            "write_stalls": 0,
+            "read_stalls": 0,
+            "bytes_in": 0,
+            "bytes_out": 0,
+            "service_time_ms_total": 0.0,
+            "service_events": 0,
+        }
+
+    def _record_queue_depth(self, stream_state: dict[str, Any]) -> None:
+        metrics = stream_state.setdefault("metrics", self._stream_metrics_template())
+        depth = int(stream_state.get("outbound_queue_bytes", 0)) + int(stream_state.get("inbound_queue_bytes", 0))
+        metrics["queue_depth_samples"] += 1
+        metrics["queue_depth_sum"] += depth
+        metrics["queue_depth_max"] = max(int(metrics.get("queue_depth_max", 0)), depth)
+
+    def _service_stream_queues(self, stream_state: dict[str, Any]) -> bytes | None:
+        start = time.time()
+        out_q = stream_state.setdefault("outbound_queue", [])
+        in_q = stream_state.setdefault("inbound_queue", [])
+        metrics = stream_state.setdefault("metrics", self._stream_metrics_template())
+        produced = None
+        if out_q:
+            data = b64d(out_q.pop(0))
+            stream_state["outbound_queue_bytes"] = max(0, int(stream_state.get("outbound_queue_bytes", 0)) - len(data))
+            try:
+                self.outbound_connector.send(stream_state["stream_id"], data)
+            except TimeoutError:
+                metrics["write_stalls"] += 1
+                out_q.insert(0, b64e(data))
+                stream_state["outbound_queue_bytes"] += len(data)
+            recv_start = time.time()
+            try:
+                produced = self.outbound_connector.recv(stream_state["stream_id"])
+                if produced:
+                    in_q.append(b64e(produced))
+                    stream_state["inbound_queue_bytes"] = int(stream_state.get("inbound_queue_bytes", 0)) + len(produced)
+                    metrics["bytes_out"] += len(produced)
+            except TimeoutError:
+                metrics["read_stalls"] += 1
+            if (time.time() - recv_start) >= self.connector_io_timeout_seconds:
+                metrics["read_stalls"] += 1
+        metrics["service_events"] += 1
+        metrics["service_time_ms_total"] += (time.time() - start) * 1000.0
+        self._record_queue_depth(stream_state)
+        if in_q:
+            data = b64d(in_q.pop(0))
+            stream_state["inbound_queue_bytes"] = max(0, int(stream_state.get("inbound_queue_bytes", 0)) - len(data))
+            return data
+        return produced
     def relay_decap_and_keys(self, ct_b64: str, circuit_id: str) -> tuple[bytes, bytes]:
         with oqs.KeyEncapsulation(self.relay_doc["kemalg"], b64d(self.relay_doc["secret_key"])) as kem:
             shared_secret = kem.decap_secret(b64d(ct_b64))
@@ -254,6 +318,15 @@ class RelayServer:
                         "connector_session_handle": repr(session.handle),
                         "connector_connected_at": session.created_at,
                         "connector_last_activity_at": session.last_activity_at,
+                        "outbound_queue": [],
+                        "inbound_queue": [],
+                        "outbound_queue_bytes": 0,
+                        "inbound_queue_bytes": 0,
+                        "queue_high_water_bytes": self.stream_queue_high_water_bytes,
+                        "queue_low_water_bytes": self.stream_queue_low_water_bytes,
+                        "blocked_since": None,
+                        "dropped_bytes": 0,
+                        "metrics": self._stream_metrics_template(),
                     }
                     self._advance_seq_window(stream_state, seq)
                     self.update_stream_state(circuit_id, stream_id, stream_state)
@@ -292,20 +365,44 @@ class RelayServer:
                     }
                 else:
                     try:
-                        self.outbound_connector.send(stream_id, str(payload).encode("utf-8"))
-                        recv_bytes = self.outbound_connector.recv(stream_id)
-                        recv_payload = recv_bytes.decode("utf-8", errors="replace")
-                        self._advance_seq_window(stream_state, seq)
-                        now = time.time()
-                        stream_state["last_activity_at"] = now
-                        stream_state["connector_last_activity_at"] = now
-                        self.update_stream_state(circuit_id, stream_id, stream_state)
-                        reply_cell = {
-                            "stream_id": stream_id,
-                            "seq": seq,
-                            "cell_type": "DATA",
-                            "payload": recv_payload,
-                        }
+                        payload_bytes = str(payload).encode("utf-8")
+                        next_depth = int(stream_state.get("outbound_queue_bytes", 0)) + len(payload_bytes)
+                        if next_depth >= int(stream_state.get("queue_high_water_bytes", self.stream_queue_high_water_bytes)):
+                            metrics = stream_state.setdefault("metrics", self._stream_metrics_template())
+                            metrics["throttled_events"] += 1
+                            stream_state["blocked_since"] = stream_state.get("blocked_since") or time.time()
+                            stream_state["dropped_bytes"] = int(stream_state.get("dropped_bytes", 0)) + len(payload_bytes)
+                            self._record_queue_depth(stream_state)
+                            reply_cell = {
+                                "stream_id": stream_id,
+                                "seq": seq,
+                                "cell_type": "ERROR",
+                                "payload": {"code": "stream_flow_control_retry", "retryable": True, "message": f"stream {stream_id} queue is full"},
+                            }
+                        else:
+                            stream_state.setdefault("outbound_queue", []).append(b64e(payload_bytes))
+                            stream_state["outbound_queue_bytes"] = next_depth
+                            stream_state.setdefault("metrics", self._stream_metrics_template())["bytes_in"] += len(payload_bytes)
+                            serviced = self._service_stream_queues(stream_state)
+                            self._advance_seq_window(stream_state, seq)
+                            now = time.time()
+                            stream_state["last_activity_at"] = now
+                            stream_state["connector_last_activity_at"] = now
+                            if int(stream_state.get("outbound_queue_bytes", 0)) <= int(stream_state.get("queue_low_water_bytes", self.stream_queue_low_water_bytes)):
+                                stream_state["blocked_since"] = None
+                            self.update_stream_state(circuit_id, stream_id, stream_state)
+                            recv_payload = (serviced or b"").decode("utf-8", errors="replace")
+                            reply_cell = {
+                                "stream_id": stream_id,
+                                "seq": seq,
+                                "cell_type": "DATA",
+                                "payload": recv_payload,
+                                "flow_control": {
+                                    "outbound_queue_bytes": stream_state.get("outbound_queue_bytes", 0),
+                                    "inbound_queue_bytes": stream_state.get("inbound_queue_bytes", 0),
+                                    "blocked_since": stream_state.get("blocked_since"),
+                                },
+                            }
                     except Exception as exc:
                         reply_cell = {
                             "stream_id": stream_id,

@@ -12,7 +12,9 @@ def b64e(data: bytes) -> str:
     return base64.b64encode(data).decode("ascii")
 
 
-def b64d(text: str) -> bytes:
+def b64d(text: str | bytes) -> bytes:
+    if isinstance(text, bytes):
+        return base64.b64decode(text)
     return base64.b64decode(text.encode("ascii"))
 
 

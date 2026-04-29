@@ -108,3 +108,16 @@ Compatibility behavior:
 - Parsers reject any `padded_len` other than the configured `CELL_PAYLOAD_BYTES`.
 - Clients/relays enforce payload byte budget pre-encryption and reject oversize payloads.
 - Padding is stripped only at the terminal consumer when decoding `payload_b64` into application `payload` text.
+
+## Relay per-stream flow control and congestion telemetry
+
+Exit stream state includes queue/capacity fields and counters to support backpressure-aware operation:
+
+- `outbound_queue_bytes`, `inbound_queue_bytes`
+- `queue_high_water_bytes`, `queue_low_water_bytes`
+- `blocked_since`, `dropped_bytes`
+- per-stream congestion metrics (`queue_depth_*`, `throttled_events`, `write_stalls`, `read_stalls`, `bytes_in`, `bytes_out`, `service_time_ms_total`, `service_events`)
+
+When a `DATA` cell would push `outbound_queue_bytes` at or above high-water, the relay rejects it with retryable `ERROR` payload code `stream_flow_control_retry` and does not advance stream sequence state. Once drained below low-water, `blocked_since` is cleared and new `DATA` is accepted.
+
+`DATA` replies include a `flow_control` section exposing live queue counters so clients and operators can detect congestion early.
