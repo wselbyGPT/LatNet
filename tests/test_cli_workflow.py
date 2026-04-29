@@ -382,3 +382,94 @@ def test_cli_admin_guard_state_view_and_reset(tmp_path, latnet_modules, capsys):
     view_out = json.loads(capsys.readouterr().out)
     assert "guards" in view_out
     assert "policy" in view_out
+
+def test_cli_circuit_build_policy_mode_preserves_guard_state_path(tmp_path, latnet_modules, monkeypatch):
+    cli = latnet_modules["cli"]
+    client = latnet_modules["client"]
+    observed: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        cli,
+        "fetch_verified_relays_from_directory",
+        lambda **_kwargs: {
+            "guard-lima": {"name": "guard-lima", "host": "127.0.0.1", "port": 9011, "kemalg": "ML-KEM-768", "public_key": "cA==", "guard_eligible": True, "middle_eligible": True, "exit_eligible": False},
+            "middle-mike": {"name": "middle-mike", "host": "127.0.0.1", "port": 9012, "kemalg": "ML-KEM-768", "public_key": "cA==", "guard_eligible": False, "middle_eligible": True, "exit_eligible": False},
+            "exit-november": {"name": "exit-november", "host": "127.0.0.1", "port": 9013, "kemalg": "ML-KEM-768", "public_key": "cA==", "guard_eligible": False, "middle_eligible": True, "exit_eligible": True},
+        },
+    )
+
+    def _fake_select_path(relays, policy, state):
+        observed["policy"] = policy
+        observed["state"] = state
+        return list(relays)
+
+    monkeypatch.setattr(cli, "select_path", _fake_select_path)
+    monkeypatch.setattr(
+        cli,
+        "build_circuit",
+        lambda path_of_relays, circuit_id=None: client.CircuitSession(
+            circuit_id=circuit_id or "cid-policy-guard-state",
+            guard_host="127.0.0.1",
+            guard_port=9011,
+            hops=[],
+        ),
+    )
+
+    custom_guard_state = tmp_path / "distinctive-guard-state.json"
+    rc = cli.main(
+        [
+            "circuit",
+            "build",
+            "--directory-host",
+            "127.0.0.1",
+            "--allow-legacy-single-authority",
+            "--policy",
+            "first_valid",
+            "--middle-count",
+            "1",
+            "--guard-state",
+            str(custom_guard_state),
+            "--session",
+            str(tmp_path / "session.json"),
+        ]
+    )
+
+    assert rc == 0
+    assert observed["policy"] == "first_valid"
+    assert observed["state"]["guard_state_path"] == str(custom_guard_state)
+
+
+def test_cli_circuit_build_explicit_relays_keeps_backward_compatible_order(tmp_path, latnet_modules, monkeypatch):
+    cli = latnet_modules["cli"]
+    client = latnet_modules["client"]
+    observed: dict[str, object] = {}
+
+    guard = tmp_path / "guard.json"
+    middle = tmp_path / "middle.json"
+    exit_relay = tmp_path / "exit.json"
+    guard.write_text(json.dumps({"name": "guard-oscar", "host": "127.0.0.1", "port": 9101, "kemalg": "ML-KEM-768", "public_key": "cA==", "guard_eligible": True, "middle_eligible": True, "exit_eligible": False}))
+    middle.write_text(json.dumps({"name": "middle-papa", "host": "127.0.0.1", "port": 9102, "kemalg": "ML-KEM-768", "public_key": "cA==", "guard_eligible": False, "middle_eligible": True, "exit_eligible": False}))
+    exit_relay.write_text(json.dumps({"name": "exit-quebec", "host": "127.0.0.1", "port": 9103, "kemalg": "ML-KEM-768", "public_key": "cA==", "guard_eligible": False, "middle_eligible": True, "exit_eligible": True}))
+
+    def _fake_select_path(relays, policy, state):
+        observed["policy"] = policy
+        observed["relay_names"] = state["relay_names"]
+        return relays
+
+    monkeypatch.setattr(cli, "select_path", _fake_select_path)
+    monkeypatch.setattr(
+        cli,
+        "build_circuit",
+        lambda path_of_relays, circuit_id=None: client.CircuitSession(
+            circuit_id=circuit_id or "cid-explicit-order",
+            guard_host="127.0.0.1",
+            guard_port=9101,
+            hops=[],
+        ),
+    )
+
+    rc = cli.main(["circuit", "build", str(guard), str(middle), str(exit_relay), "--session", str(tmp_path / "session.json")])
+
+    assert rc == 0
+    assert observed["policy"] == "ordered"
+    assert observed["relay_names"] == ["guard-oscar", "middle-papa", "exit-quebec"]
