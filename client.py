@@ -27,6 +27,8 @@ from .wire import recv_msg, send_msg
 NO_DESCRIPTOR_ERROR = "no descriptor available for hidden service"
 EXPIRED_DESCRIPTOR_ERROR = "hidden service descriptor is expired"
 NO_REACHABLE_INTRO_POINTS_ERROR = "all introduction points are expired or unreachable"
+_MIN_SELECTION_PROBABILITY = 0.05
+_DEFAULT_TOP_N = 3
 
 
 class PublishDescriptorError(ValueError):
@@ -454,20 +456,74 @@ def order_intro_points_for_phase1(descriptor: dict[str, Any], *, now: int | None
     if not reachable:
         raise ValueError(NO_REACHABLE_INTRO_POINTS_ERROR)
 
-    preferred = reachable[0]
-    fallbacks = sorted(
-        reachable[1:],
-        key=lambda point: (
-            str(point.get("relay_name", "")),
-            str(point["relay_addr"].get("host", "")),
-            int(point["relay_addr"].get("port", 0)),
-        ),
-    )
-    return [preferred, *fallbacks]
+    ranked = _score_and_order_relays(reachable, now=now)
+    return ranked
 
 
 def select_intro_point_for_phase1(descriptor: dict[str, Any], *, now: int | None = None) -> dict[str, Any]:
     return order_intro_points_for_phase1(descriptor, now=now)[0]
+
+
+def _relay_key_from_point(point: dict[str, Any]) -> str:
+    relay_addr = point.get("relay_addr", {})
+    return f"{point.get('relay_name', '')}|{relay_addr.get('host', '')}|{relay_addr.get('port', 0)}"
+
+
+def _score_and_order_relays(
+    candidates: list[dict[str, Any]],
+    *,
+    now: int,
+    top_n: int = _DEFAULT_TOP_N,
+    rng_seed: int | None = None,
+) -> list[dict[str, Any]]:
+    rng = random.Random(rng_seed)
+    scored: list[tuple[float, dict[str, Any]]] = []
+    for point in candidates:
+        score = _relay_health_score_from_point(point, now=now)
+        scored.append((score, point))
+    scored.sort(key=lambda item: item[0], reverse=True)
+    if len(scored) <= 1:
+        return [item[1] for item in scored]
+
+    head = scored[: max(1, min(top_n, len(scored)))]
+    tail = scored[max(1, min(top_n, len(scored))) :]
+    picked_head = _weighted_shuffle(head, rng=rng)
+    return [item[1] for item in picked_head + tail]
+
+
+def _weighted_shuffle(weighted: list[tuple[float, dict[str, Any]]], *, rng: random.Random) -> list[tuple[float, dict[str, Any]]]:
+    remaining = list(weighted)
+    ordered: list[tuple[float, dict[str, Any]]] = []
+    while remaining:
+        weights = [max(_MIN_SELECTION_PROBABILITY, item[0]) for item in remaining]
+        idx = rng.choices(range(len(remaining)), weights=weights, k=1)[0]
+        ordered.append(remaining.pop(idx))
+    return ordered
+
+
+def _relay_health_score_from_point(point: dict[str, Any], *, now: int) -> float:
+    telemetry = point.get("relay_health")
+    if not isinstance(telemetry, dict):
+        telemetry = {}
+    if "health_score" in point and isinstance(point["health_score"], (int, float)):
+        return max(_MIN_SELECTION_PROBABILITY, float(point["health_score"]))
+
+    success_rate = float(telemetry.get("success_rate", 0.5))
+    timeout_rate = float(telemetry.get("timeout_rate", 0.0))
+    recent_latency_ms = float(telemetry.get("recent_latency_ms", 200.0))
+    fail_streak = float(telemetry.get("recent_failures", 0.0))
+    success_streak = float(telemetry.get("recent_successes", 0.0))
+    measured_at = telemetry.get("measured_at")
+    age_s = max(0.0, float(now - measured_at)) if isinstance(measured_at, int) else 0.0
+
+    latency_factor = 1.0 / (1.0 + (recent_latency_ms / 400.0))
+    freshness = 1.0 / (1.0 + age_s / 1800.0)
+    failure_penalty = min(0.7, fail_streak * 0.2)
+    recovery_bonus = min(0.25, success_streak * 0.05)
+    score = (0.55 * success_rate) + (0.25 * latency_factor) + (0.20 * (1.0 - timeout_rate))
+    score = score * freshness
+    score = max(0.0, score - failure_penalty + recovery_bonus)
+    return max(_MIN_SELECTION_PROBABILITY, min(1.0, score))
 
 
 
@@ -769,4 +825,3 @@ __all__ = [
     "build_keepalive_cell",
     "KeepaliveConfig",
 ]
-

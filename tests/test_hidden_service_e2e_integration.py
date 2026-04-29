@@ -199,3 +199,30 @@ def test_hidden_service_end_to_end_echo_via_directory(monkeypatch, latnet_module
     finally:
         while servers:
             servers.pop().stop()
+
+
+def test_rendezvous_selection_prefers_healthy_candidate(latnet_modules):
+    runtime = latnet_modules["hidden_service_runtime"]
+    intro = {
+        "rendezvous_relays": [
+            {"name": "bad", "host": "127.0.0.1", "port": 10, "relay_health": {"success_rate": 0.2, "timeout_rate": 0.7, "recent_latency_ms": 1500, "recent_failures": 4}},
+            {"name": "good", "host": "127.0.0.1", "port": 11, "relay_health": {"success_rate": 0.95, "timeout_rate": 0.01, "recent_latency_ms": 40, "recent_successes": 3}},
+        ]
+    }
+    picks = {"good": 0, "bad": 0}
+    for seed in range(200):
+        selected = runtime._choose_rendezvous_relay(intro, now=1_700_000_000, rng_seed=seed)
+        picks[selected["name"]] += 1
+    assert picks["good"] > picks["bad"]
+
+
+def test_rendezvous_selection_floor_when_all_low_scores(latnet_modules):
+    runtime = latnet_modules["hidden_service_runtime"]
+    intro = {
+        "rendezvous_relays": [
+            {"name": "a", "host": "127.0.0.1", "port": 10, "health_score": 0.0},
+            {"name": "b", "host": "127.0.0.1", "port": 11, "health_score": 0.0},
+        ]
+    }
+    seen = {runtime._choose_rendezvous_relay(intro, now=1_700_000_000, rng_seed=seed)["name"] for seed in range(100)}
+    assert seen == {"a", "b"}

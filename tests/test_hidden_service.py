@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import random
 
 import pytest
 
@@ -62,3 +63,49 @@ def test_models_init_exports_hidden_service_symbols(latnet_modules):
     assert hasattr(models, "derive_lettuce_name_from_b64")
     assert hasattr(models, "is_valid_lettuce_name")
     assert hasattr(models, "parse_lettuce_name")
+
+
+def test_intro_point_weighted_scoring_prefers_healthy_relays(latnet_modules):
+    client = latnet_modules["client"]
+    now = 1_700_000_100
+    healthy = {
+        "relay_name": "healthy",
+        "relay_addr": {"host": "h", "port": 1},
+        "expires_at": now + 100,
+        "relay_health": {"success_rate": 0.95, "timeout_rate": 0.01, "recent_latency_ms": 50, "measured_at": now},
+    }
+    unhealthy = {
+        "relay_name": "unhealthy",
+        "relay_addr": {"host": "u", "port": 2},
+        "expires_at": now + 100,
+        "relay_health": {"success_rate": 0.1, "timeout_rate": 0.8, "recent_latency_ms": 1000, "recent_failures": 5, "measured_at": now},
+    }
+    picks = {"healthy": 0, "unhealthy": 0}
+    for seed in range(200):
+        ordered = client._score_and_order_relays([healthy, unhealthy], now=now, rng_seed=seed)
+        picks[ordered[0]["relay_name"]] += 1
+    assert picks["healthy"] > picks["unhealthy"]
+
+
+def test_intro_point_selection_has_floor_when_all_scores_low(latnet_modules):
+    client = latnet_modules["client"]
+    now = 1_700_000_200
+    a = {"relay_name": "a", "relay_addr": {"host": "a", "port": 1}, "expires_at": now + 100, "relay_health": {"success_rate": 0.0, "timeout_rate": 1.0, "recent_latency_ms": 2000, "recent_failures": 10}}
+    b = {"relay_name": "b", "relay_addr": {"host": "b", "port": 2}, "expires_at": now + 100, "relay_health": {"success_rate": 0.0, "timeout_rate": 1.0, "recent_latency_ms": 2500, "recent_failures": 10}}
+    seen = set()
+    for seed in range(100):
+        seen.add(client._score_and_order_relays([a, b], now=now, rng_seed=seed)[0]["relay_name"])
+    assert seen == {"a", "b"}
+
+
+def test_weighted_selection_stability_with_seed(latnet_modules):
+    client = latnet_modules["client"]
+    now = 1_700_000_300
+    relays = [
+        {"relay_name": "r1", "relay_addr": {"host": "h1", "port": 1}, "expires_at": now + 100, "health_score": 0.9},
+        {"relay_name": "r2", "relay_addr": {"host": "h2", "port": 2}, "expires_at": now + 100, "health_score": 0.6},
+        {"relay_name": "r3", "relay_addr": {"host": "h3", "port": 3}, "expires_at": now + 100, "health_score": 0.4},
+    ]
+    first = [p["relay_name"] for p in client._score_and_order_relays(relays, now=now, rng_seed=42)]
+    second = [p["relay_name"] for p in client._score_and_order_relays(relays, now=now, rng_seed=42)]
+    assert first == second
