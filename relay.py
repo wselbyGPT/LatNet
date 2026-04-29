@@ -4,6 +4,8 @@ import json
 import socket
 import threading
 import time
+import hashlib
+import hmac
 from pathlib import Path
 from typing import Any
 
@@ -13,7 +15,7 @@ from .constants import CELL_PAYLOAD_BYTES, DEFAULT_TIMEOUT, KEMALG
 from .crypto import decrypt_layer, derive_hop_keys, encrypt_layer
 from .exit_connector import DemoOutboundConnector, EgressPolicyError, ExitPolicy, OutboundConnector, PolicyEnforcedTcpConnector, TcpOutboundConnector
 from .models.protocol import encode_stream_cell_payload, parse_build_envelope, parse_cell_envelope, parse_destroy_envelope, parse_exit_cell_layer, parse_layer
-from .util import atomic_write_json, b64d, b64e, load_json
+from .util import atomic_write_json, b64d, b64e, canonical_bytes, load_json
 from .wire import recv_msg, send_msg
 from .rate_limit import FixedWindowRateLimiter
 from .observability import Metrics
@@ -80,6 +82,8 @@ class RelayServer:
         self.intro_poll_limiter = FixedWindowRateLimiter(intro_poll_rate_limit, intro_poll_window_seconds)
         self.intro_poll_items_page_size = max(int(intro_poll_items_page_size), 0)
         self.metrics = Metrics()
+        self.consumed_token_jtis: dict[str, float] = {}
+        self.max_consumed_token_jtis = 10000
 
     @staticmethod
     def _touch_state(state: dict[str, Any], now: float | None = None) -> None:
@@ -114,6 +118,45 @@ class RelayServer:
             state["closed_at"] = ts
         state["last_activity_at"] = ts
 
+
+
+    def _verify_auth_token(self, token: Any, *, expected_cookie: str, expected_side: str | None = None, now: float | None = None) -> tuple[bool, str | None, dict[str, Any] | None]:
+        ts = time.time() if now is None else float(now)
+        if not isinstance(token, dict):
+            return False, "token_missing", None
+        payload = token.get("payload")
+        sig_b64 = token.get("sig")
+        if not isinstance(payload, dict) or not isinstance(sig_b64, str):
+            return False, "token_invalid", None
+        key = b64d(self.relay_doc["secret_key"])
+        expected = hmac.new(key, canonical_bytes(payload), hashlib.sha256).digest()
+        if not hmac.compare_digest(expected, b64d(sig_b64)):
+            return False, "token_invalid", None
+        exp = payload.get("exp")
+        iat = payload.get("iat")
+        jti = payload.get("jti")
+        scope = payload.get("scope")
+        if not isinstance(exp, int) or not isinstance(iat, int) or not isinstance(jti, str) or not isinstance(scope, dict):
+            return False, "token_invalid", None
+        if exp <= int(ts):
+            return False, "token_expired", None
+        if scope.get("rendezvous_cookie") != expected_cookie:
+            return False, "token_scope", None
+        if expected_side and scope.get("side") != expected_side:
+            return False, "token_scope", None
+        if scope.get("relay_name") not in {None, self.relay_doc.get("name")}:
+            return False, "token_scope", None
+        return True, None, payload
+
+    def _consume_token_jti(self, jti: str, exp: int) -> tuple[bool, str | None]:
+        if jti in self.consumed_token_jtis:
+            return False, "token_replay"
+        self.consumed_token_jtis[jti] = float(exp)
+        if len(self.consumed_token_jtis) > self.max_consumed_token_jtis:
+            oldest = sorted(self.consumed_token_jtis.items(), key=lambda item: item[1])[: max(1, len(self.consumed_token_jtis) - self.max_consumed_token_jtis)]
+            for key, _ in oldest:
+                self.consumed_token_jtis.pop(key, None)
+        return True, None
     def circuit_snapshot(self, circuit_id: str) -> dict[str, Any] | None:
         with self.lock:
             state = self.circuits.get(circuit_id)
@@ -580,6 +623,10 @@ class RelayServer:
                     if peer_circuit_id:
                         self.rendezvous_links.pop(peer_circuit_id, None)
 
+            stale_jtis = [jti for jti, exp in self.consumed_token_jtis.items() if exp <= ts]
+            for jti in stale_jtis:
+                self.consumed_token_jtis.pop(jti, None)
+
     def handle_build(self, msg: dict[str, Any]) -> dict[str, Any]:
         self.cleanup_stale_state()
         env = parse_build_envelope(msg)
@@ -691,8 +738,14 @@ class RelayServer:
                 cookie = decoded_layer.get("rendezvous_cookie")
                 if not isinstance(cookie, str) or not cookie:
                     return {"ok": False, "error": "missing or invalid field: rendezvous_cookie"}
+                valid, err_cls, payload = self._verify_auth_token(decoded_layer.get("auth_token"), expected_cookie=cookie, expected_side="client")
+                if not valid:
+                    return {"ok": False, "error": "invalid introduction auth token", "error_class": err_cls}
                 now = time.time()
                 with self.lock:
+                    ok_consume, consume_err = self._consume_token_jti(str(payload.get("jti")), int(payload.get("exp")))
+                    if not ok_consume:
+                        return {"ok": False, "error": "replayed introduction auth token", "error_class": consume_err}
                     self.pending_introductions[cookie] = {
                         "intro_circuit_id": circuit_id,
                         "intro_payload": decoded_layer.get("introduction"),
@@ -764,8 +817,14 @@ class RelayServer:
                     return {"ok": False, "error": "missing or invalid field: rendezvous_cookie"}
                 if side not in {"client", "service"}:
                     return {"ok": False, "error": "missing or invalid field: side"}
+                valid, err_cls, payload = self._verify_auth_token(decoded_layer.get("auth_token"), expected_cookie=cookie, expected_side=side)
+                if not valid:
+                    return {"ok": False, "error": "invalid rendezvous auth token", "error_class": err_cls}
                 now = time.time()
                 with self.lock:
+                    ok_consume, consume_err = self._consume_token_jti(str(payload.get("jti")), int(payload.get("exp")))
+                    if not ok_consume:
+                        return {"ok": False, "error": "replayed rendezvous auth token", "error_class": consume_err}
                     entry = self.pending_rendezvous.setdefault(
                         cookie,
                         {

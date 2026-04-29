@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import time
+import hashlib
+import hmac
 
 
 def _ready_state(mock_key_material: dict, role: str) -> dict:
@@ -14,6 +16,14 @@ def _ready_state(mock_key_material: dict, role: str) -> dict:
         "last_activity_at": time.time(),
     }
 
+
+
+
+def _token(util, relay_doc: dict, cookie: str, side: str, *, exp_offset: int = 30, jti: str = "jti-1") -> dict:
+    now = int(time.time())
+    payload = {"jti": jti, "iat": now, "exp": now + exp_offset, "scope": {"service_name": "svc", "relay_name": relay_doc["name"], "rendezvous_cookie": cookie, "side": side}}
+    sig = hmac.new(util.b64d(relay_doc["secret_key"]), util.canonical_bytes(payload), hashlib.sha256).digest()
+    return {"payload": payload, "sig": util.b64e(sig)}
 
 def _send_hs_cell(server, crypto, key: bytes, circuit_id: str, layer: dict) -> dict:
     return server.handle_cell({"type": "CELL", "circuit_id": circuit_id, "layer": crypto.encrypt_layer(key, layer)})
@@ -31,7 +41,7 @@ def test_intro_pending_create_and_expire(latnet_modules, relay_doc_fixture, mock
         crypto,
         mock_key_material["forward"],
         "intro-c",
-        {"cmd": "INTRODUCE", "rendezvous_cookie": "cookie-expire", "introduction": {"a": 1}},
+        {"cmd": "INTRODUCE", "rendezvous_cookie": "cookie-expire", "introduction": {"a": 1}, "auth_token": _token(latnet_modules["util"], relay_doc_fixture, "cookie-expire", "client", jti="i1")},
     )
     assert "cookie-expire" in server.pending_introductions
 
@@ -53,7 +63,7 @@ def test_rendezvous_half_join_then_full_join(latnet_modules, relay_doc_fixture, 
         crypto,
         mock_key_material["forward"],
         "c-client",
-        {"cmd": "RENDEZVOUS_ESTABLISH", "rendezvous_cookie": "cookie-join", "side": "client"},
+        {"cmd": "RENDEZVOUS_ESTABLISH", "rendezvous_cookie": "cookie-join", "side": "client", "auth_token": _token(latnet_modules["util"], relay_doc_fixture, "cookie-join", "client", jti="r1")},
     )
     assert server.pending_rendezvous["cookie-join"]["joined"] is False
 
@@ -62,7 +72,7 @@ def test_rendezvous_half_join_then_full_join(latnet_modules, relay_doc_fixture, 
         crypto,
         mock_key_material["forward"],
         "c-service",
-        {"cmd": "RENDEZVOUS_ESTABLISH", "rendezvous_cookie": "cookie-join", "side": "service"},
+        {"cmd": "RENDEZVOUS_ESTABLISH", "rendezvous_cookie": "cookie-join", "side": "service", "auth_token": _token(latnet_modules["util"], relay_doc_fixture, "cookie-join", "service", jti="r2")},
     )
     joined = server.pending_rendezvous["cookie-join"]
     assert joined["joined"] is True
@@ -83,14 +93,14 @@ def test_destroy_cleans_up_rendezvous_mappings(latnet_modules, relay_doc_fixture
         crypto,
         mock_key_material["forward"],
         "d-client",
-        {"cmd": "RENDEZVOUS_ESTABLISH", "rendezvous_cookie": "cookie-destroy", "side": "client"},
+        {"cmd": "RENDEZVOUS_ESTABLISH", "rendezvous_cookie": "cookie-destroy", "side": "client", "auth_token": _token(latnet_modules["util"], relay_doc_fixture, "cookie-destroy", "client", jti="d1")},
     )
     _send_hs_cell(
         server,
         crypto,
         mock_key_material["forward"],
         "d-service",
-        {"cmd": "RENDEZVOUS_ESTABLISH", "rendezvous_cookie": "cookie-destroy", "side": "service"},
+        {"cmd": "RENDEZVOUS_ESTABLISH", "rendezvous_cookie": "cookie-destroy", "side": "service", "auth_token": _token(latnet_modules["util"], relay_doc_fixture, "cookie-destroy", "service", jti="d2")},
     )
 
     response = server.handle_destroy({"type": "DESTROY", "circuit_id": "d-client"})
@@ -116,14 +126,14 @@ def test_intro_poll_rate_limited_and_page_size(latnet_modules, relay_doc_fixture
         crypto,
         mock_key_material["forward"],
         "intro-rate",
-        {"cmd": "INTRODUCE", "rendezvous_cookie": "cookie-1", "introduction": {"a": 1}},
+        {"cmd": "INTRODUCE", "rendezvous_cookie": "cookie-1", "introduction": {"a": 1}, "auth_token": _token(latnet_modules["util"], relay_doc_fixture, "cookie-1", "client", jti="p1")},
     )
     _send_hs_cell(
         server,
         crypto,
         mock_key_material["forward"],
         "intro-rate",
-        {"cmd": "INTRODUCE", "rendezvous_cookie": "cookie-2", "introduction": {"a": 2}},
+        {"cmd": "INTRODUCE", "rendezvous_cookie": "cookie-2", "introduction": {"a": 2}, "auth_token": _token(latnet_modules["util"], relay_doc_fixture, "cookie-2", "client", jti="p2")},
     )
     poll_1 = _send_hs_cell(server, crypto, mock_key_material["forward"], "intro-rate", {"cmd": "INTRO_POLL"})
     layer_1 = crypto.decrypt_layer(mock_key_material["reverse"], poll_1["reply_layer"])

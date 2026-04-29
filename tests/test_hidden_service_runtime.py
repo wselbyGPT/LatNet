@@ -182,7 +182,14 @@ def test_service_intro_to_rendezvous_echo_flow(monkeypatch, latnet_modules, tmp_
 
         client_establish = runtime._send_circuit_cmd(
             client_rdv_circuit,
-            {"cmd": "RENDEZVOUS_ESTABLISH", "rendezvous_cookie": "cookie-echo", "side": "client"},
+            {
+                "cmd": "RENDEZVOUS_ESTABLISH",
+                "rendezvous_cookie": "cookie-echo",
+                "side": "client",
+                "auth_token": runtime.mint_intro_auth_token(
+                    "cookie-echo", relay_doc=rendezvous_relay, service_name="svc", side="client"
+                ),
+            },
         )
         assert client_establish["cmd"] == "RENDEZVOUS_STATE"
         assert client_establish["joined"] is False
@@ -193,6 +200,9 @@ def test_service_intro_to_rendezvous_echo_flow(monkeypatch, latnet_modules, tmp_
                 "cmd": "INTRODUCE",
                 "rendezvous_cookie": "cookie-echo",
                 "introduction": {"rendezvous_relay": rendezvous_relay},
+                "auth_token": runtime.mint_intro_auth_token(
+                    "cookie-echo", relay_doc=intro_relay, service_name="svc", side="client"
+                ),
             },
         )
         assert intro_reply["cmd"] == "INTRO_STORED"
