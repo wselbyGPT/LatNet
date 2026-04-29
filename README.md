@@ -55,3 +55,13 @@ CI example (fail build when rendezvous join success rate drops below 99%):
 ```bash
 python scripts/hs_slo_summary.py --events artifacts/hs_events_last_24h.jsonl --contract docs/hs_slo_contract.json --format json   | python -c 'import json,sys; d=json.load(sys.stdin); s=d["rdv_join_success_rate"] or 0; sys.exit(0 if s>=0.99 else 1)'
 ```
+
+## Guard state persistence
+
+LatNet now persists client guard-selection state in `.latnet-guards.json` (override with `--guard-state`). The file tracks pinned guards, first_seen/last_success timestamps, failure/quarantine metadata, and the active guard pointer. During `circuit build --policy first_valid`, hop 0 prefers healthy pinned guards before admitting new candidates.
+
+Policy parameters are stored in the guard state under `policy`: `max_pinned_guards`, `rotation_interval_s`, `failure_threshold`, `cooldown_s`, and `forced_refresh_s`.
+
+Admin operations:
+- `latnet admin guard-state view [--guard-state PATH]`
+- `latnet admin guard-state reset [--guard-state PATH]`

@@ -229,3 +229,24 @@ hs send --session .latnet-hs.json 'hello'
 hs recv --session .latnet-hs.json --timeout 5 --follow
 hs end --session .latnet-hs.json --payload 'bye'
 ```
+
+## Guard set operations
+
+Client guard-set state is stored in `.latnet-guards.json` by default. Build operations using policy selection update this file and prefer healthy pinned guards for hop 0.
+
+State includes:
+- pinned guard entries (`guards`)
+- `first_seen` / `last_success`
+- failure counters and `quarantine_until`
+- `active_guard`
+
+Tuneable policy fields:
+- `max_pinned_guards`
+- `rotation_interval_s`
+- `failure_threshold`
+- `cooldown_s`
+- `forced_refresh_s`
+
+Operator commands:
+- `latnet admin guard-state view`
+- `latnet admin guard-state reset`

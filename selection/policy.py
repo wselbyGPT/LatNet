@@ -222,7 +222,36 @@ def _first_valid_policy(relays: list[Relay], state: dict[str, Any]) -> list[Rela
     guard_candidates = pick_with_policy("guard", [])
     if not guard_candidates:
         raise ValueError("no guard-eligible relay available under diversity policy")
-    guard = _weighted_pick(guard_candidates, "guard", policy_config=policy_config, rng=rng)
+
+    guard_state_path = state.get("guard_state_path")
+    guard = None
+    if isinstance(guard_state_path, str) and guard_state_path:
+        now = int(state.get("now", 0) or 0) or int(__import__("time").time())
+        gstate = _load_guard_state(guard_state_path, now)
+        healthy = set(_healthy_pinned_names(gstate, now))
+        pinned = [relay for relay in guard_candidates if str(relay.get("name", "")) in healthy]
+        pool = pinned or guard_candidates
+        guard = _weighted_pick(pool, "guard", policy_config=policy_config, rng=rng)
+
+        name = str(guard.get("name", ""))
+        guards_meta = gstate.setdefault("guards", {})
+        entry = guards_meta.get(name, {}) if isinstance(guards_meta.get(name), dict) else {}
+        if not entry.get("first_seen"):
+            entry["first_seen"] = now
+        entry["last_success"] = now
+        entry["failures"] = int(entry.get("failures", 0) or 0)
+        entry["quarantine_until"] = int(entry.get("quarantine_until", 0) or 0)
+        guards_meta[name] = entry
+
+        max_pinned = int(gstate.get("policy", {}).get("max_pinned_guards", 3) or 3)
+        if len(guards_meta) > max_pinned:
+            ordered = sorted(guards_meta.items(), key=lambda item: int(item[1].get("last_success", 0) or 0), reverse=True)
+            gstate["guards"] = dict(ordered[:max_pinned])
+        gstate["active_guard"] = name
+        gstate["updated_at"] = now
+        _save_guard_state(guard_state_path, gstate)
+    else:
+        guard = _weighted_pick(guard_candidates, "guard", policy_config=policy_config, rng=rng)
 
     selected = [guard]
 
@@ -247,6 +276,66 @@ def _first_valid_policy(relays: list[Relay], state: dict[str, Any]) -> list[Rela
     return selected
 
 
+
+
+
+def _guard_state_defaults(now: int) -> dict[str, Any]:
+    return {
+        "version": 1,
+        "policy": {
+            "max_pinned_guards": 3,
+            "rotation_interval_s": 7 * 24 * 3600,
+            "failure_threshold": 3,
+            "cooldown_s": 600,
+            "forced_refresh_s": 30 * 24 * 3600,
+        },
+        "active_guard": None,
+        "guards": {},
+        "updated_at": now,
+    }
+
+
+def _load_guard_state(path: str, now: int) -> dict[str, Any]:
+    import json
+    from pathlib import Path
+
+    fp = Path(path)
+    if not fp.exists():
+        return _guard_state_defaults(now)
+    raw = json.loads(fp.read_text())
+    if not isinstance(raw, dict):
+        return _guard_state_defaults(now)
+    state = _guard_state_defaults(now)
+    state.update(raw)
+    if not isinstance(state.get("guards"), dict):
+        state["guards"] = {}
+    if not isinstance(state.get("policy"), dict):
+        state["policy"] = _guard_state_defaults(now)["policy"]
+    else:
+        merged = _guard_state_defaults(now)["policy"]
+        merged.update(state["policy"])
+        state["policy"] = merged
+    return state
+
+
+def _save_guard_state(path: str, data: dict[str, Any]) -> None:
+    import json
+    from pathlib import Path
+
+    fp = Path(path)
+    fp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+
+
+def _healthy_pinned_names(guard_state: dict[str, Any], now: int) -> list[str]:
+    result: list[str] = []
+    for name, meta in guard_state.get("guards", {}).items():
+        if not isinstance(meta, dict):
+            continue
+        quarantine_until = int(meta.get("quarantine_until", 0) or 0)
+        if quarantine_until > now:
+            continue
+        result.append(str(name))
+    return result
 def select_path(relays: list[Relay], policy: str, state: dict[str, Any] | None = None) -> list[Relay]:
     if not isinstance(relays, list):
         raise ValueError("relays must be a list")
