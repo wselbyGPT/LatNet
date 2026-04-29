@@ -99,3 +99,39 @@ def test_destroy_cleans_up_rendezvous_mappings(latnet_modules, relay_doc_fixture
     assert "cookie-destroy" not in server.pending_rendezvous
     assert "d-client" not in server.rendezvous_links
     assert "d-service" not in server.rendezvous_links
+
+
+def test_intro_poll_rate_limited_and_page_size(latnet_modules, relay_doc_fixture, mock_key_material):
+    relay_mod = latnet_modules["relay"]
+    crypto = latnet_modules["crypto"]
+    server = relay_mod.RelayServer(
+        relay_doc_fixture,
+        intro_poll_rate_limit=1,
+        intro_poll_window_seconds=60.0,
+        intro_poll_items_page_size=1,
+    )
+    server.set_circuit_state("intro-rate", _ready_state(mock_key_material, "intro"))
+    _send_hs_cell(
+        server,
+        crypto,
+        mock_key_material["forward"],
+        "intro-rate",
+        {"cmd": "INTRODUCE", "rendezvous_cookie": "cookie-1", "introduction": {"a": 1}},
+    )
+    _send_hs_cell(
+        server,
+        crypto,
+        mock_key_material["forward"],
+        "intro-rate",
+        {"cmd": "INTRODUCE", "rendezvous_cookie": "cookie-2", "introduction": {"a": 2}},
+    )
+    poll_1 = _send_hs_cell(server, crypto, mock_key_material["forward"], "intro-rate", {"cmd": "INTRO_POLL"})
+    layer_1 = crypto.decrypt_layer(mock_key_material["reverse"], poll_1["reply_layer"])
+    assert layer_1["cmd"] == "INTRO_PENDING"
+    assert len(layer_1["items"]) == 1
+
+    poll_2 = _send_hs_cell(server, crypto, mock_key_material["forward"], "intro-rate", {"cmd": "INTRO_POLL"})
+    layer_2 = crypto.decrypt_layer(mock_key_material["reverse"], poll_2["reply_layer"])
+    assert layer_2["cmd"] == "INTRO_RATE_LIMITED"
+    assert layer_2["error_class"] == "rate_limited"
+    assert layer_2["retry_after_seconds"] >= 1

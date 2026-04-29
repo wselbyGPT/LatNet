@@ -445,3 +445,35 @@ def test_publish_rejects_descriptor_service_name_mismatch(tmp_path, latnet_modul
         assert service_name != wrong_name
     finally:
         client_sock.close()
+
+
+def test_get_hidden_service_descriptor_rate_limited_boundary(tmp_path, latnet_modules):
+    wire = latnet_modules["wire"]
+    directory_mod = latnet_modules["directory"]
+    hs_doc = _make_hs_descriptor_doc(latnet_modules, tmp_path)
+    service_name = hs_doc["signed"]["service_name"]
+    bundle_path = tmp_path / "bundle.json"
+    bundle_path.write_text('{"version":1,"descriptors":[]}', encoding="utf-8")
+    hs_store_path = tmp_path / "hs_store.json"
+    hs_store_path.write_text(json.dumps({"version": 1, "descriptors": [hs_doc]}), encoding="utf-8")
+    server = directory_mod.DirectoryServer(
+        str(bundle_path),
+        hidden_service_store_path=str(hs_store_path),
+        descriptor_fetch_rate_limit=2,
+        descriptor_fetch_window_seconds=60.0,
+    )
+    for idx in range(3):
+        client_sock, server_sock = socket.socketpair()
+        try:
+            thread = _run_handle_conn(server, server_sock)
+            wire.send_msg(client_sock, {"type": "GET_HS_DESCRIPTOR", "service_name": service_name})
+            response = wire.recv_msg(client_sock)
+            thread.join(timeout=1)
+            if idx < 2:
+                assert response["ok"] is True
+            else:
+                assert response["ok"] is False
+                assert response["error_class"] == "rate_limited"
+                assert response["retry_after_seconds"] >= 1
+        finally:
+            client_sock.close()
