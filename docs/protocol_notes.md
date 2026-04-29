@@ -76,6 +76,20 @@ The CLI hidden-service flows now emit JSON lines with a standard envelope:
 
 Runtime summary metrics are emitted in the `metrics` field on shutdown events, including intro request counts, rendezvous join success/failure and latency stats, and relay command failures by error type.
 
+## Hidden-service timing obfuscation modes
+
+Hidden-service runtime exposes `--timing-mode` for `hs serve`, `hs send`, `hs recv`, and `hs end` with:
+
+- `off`: no added delay and no dummy control traffic.
+- `low`: small randomized delay envelope plus low-rate optional dummy control cells.
+- `high`: larger randomized envelope and more frequent dummy control cells.
+
+Tradeoffs for operators:
+
+- Higher obfuscation increases traffic-shape resistance but adds median/tail latency.
+- Each mode enforces a bounded latency cap per obfuscation step so poll/join/recv loops remain within reliability SLO budgets.
+- Dummy traffic can increase relay load and noise in control-plane metrics; treat this as expected when enabling `low`/`high`.
+
 ## Operations documentation
 
 - `docs/operator_playbook.md` is the primary operator runbook for hidden service bootstrap, publish/rotation, troubleshooting, and alert thresholds.
