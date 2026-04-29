@@ -11,7 +11,7 @@ import oqs
 
 from .constants import CELL_PAYLOAD_BYTES, DEFAULT_TIMEOUT, KEMALG
 from .crypto import decrypt_layer, derive_hop_keys, encrypt_layer
-from .exit_connector import DemoOutboundConnector, OutboundConnector, TcpOutboundConnector
+from .exit_connector import DemoOutboundConnector, EgressPolicyError, ExitPolicy, OutboundConnector, PolicyEnforcedTcpConnector, TcpOutboundConnector
 from .models.protocol import encode_stream_cell_payload, parse_build_envelope, parse_cell_envelope, parse_destroy_envelope, parse_exit_cell_layer, parse_layer
 from .util import atomic_write_json, b64d, b64e, load_json
 from .wire import recv_msg, send_msg
@@ -47,6 +47,7 @@ class RelayServer:
         enable_real_egress: bool = False,
         outbound_connect_timeout: float = DEFAULT_TIMEOUT,
         outbound_recv_timeout: float = DEFAULT_TIMEOUT,
+        exit_policy: ExitPolicy | None = None,
     ):
         self.relay_doc = relay_doc
         self.circuits: dict[str, dict[str, Any]] = {}
@@ -61,7 +62,7 @@ class RelayServer:
         self.pending_rendezvous: dict[str, dict[str, Any]] = {}
         self.rendezvous_links: dict[str, dict[str, Any]] = {}
         self.outbound_connector = outbound_connector or (
-            TcpOutboundConnector(connect_timeout=outbound_connect_timeout, recv_timeout=outbound_recv_timeout)
+            PolicyEnforcedTcpConnector(connect_timeout=outbound_connect_timeout, recv_timeout=outbound_recv_timeout, policy=exit_policy)
             if enable_real_egress
             else DemoOutboundConnector()
         )
@@ -263,12 +264,8 @@ class RelayServer:
                         "payload": f"stream {stream_id} opened to {target['host']}:{target['port']} at exit {self.relay_doc['name']}",
                     }
                 except Exception as exc:
-                    reply_cell = {
-                        "stream_id": stream_id,
-                        "seq": seq,
-                        "cell_type": "ERROR",
-                        "payload": f"connect failed: {exc}",
-                    }
+                    code = exc.code if isinstance(exc, EgressPolicyError) else "connect_failed"
+                    reply_cell = {"stream_id": stream_id, "seq": seq, "cell_type": "ERROR", "payload": {"code": code, "message": f"connect failed: {exc}"}}
         elif cell_type == "DATA":
             if not stream_state:
                 reply_cell = {
@@ -883,12 +880,26 @@ def run_relay_server(relay_path: str) -> None:
     relay_doc = load_json(relay_path)
     host = relay_doc["host"]
     port = relay_doc["port"]
+    policy_doc = relay_doc.get("exit_policy") or {}
+    exit_policy = ExitPolicy(
+        allow_ports=[int(p) for p in policy_doc.get("allow_ports", [])],
+        deny_ports=[int(p) for p in policy_doc.get("deny_ports", [])],
+        allow_domains=[str(p) for p in policy_doc.get("allow_domains", ["*"])],
+        deny_domains=[str(p) for p in policy_doc.get("deny_domains", [])],
+        dns_server=policy_doc.get("dns_server"),
+        deny_private_addresses=bool(policy_doc.get("deny_private_addresses", True)),
+        max_concurrent_streams=int(policy_doc.get("max_concurrent_streams", 128)),
+        max_new_connections_per_window=int(policy_doc.get("max_new_connections_per_window", 256)),
+        rate_window_seconds=float(policy_doc.get("rate_window_seconds", 60.0)),
+        max_attempts_per_destination=policy_doc.get("max_attempts_per_destination"),
+    )
     server = RelayServer(
         relay_doc,
         use_persistent_channels=bool(relay_doc.get("use_persistent_channels", False)),
         circuit_ttl_seconds=float(relay_doc.get("circuit_ttl_seconds", 900.0)),
         circuit_idle_seconds=float(relay_doc.get("circuit_idle_seconds", 300.0)),
         stream_idle_seconds=float(relay_doc.get("stream_idle_seconds", 120.0)),
+        exit_policy=exit_policy,
     )
 
     print(f"Starting relay {relay_doc['name']} on {host}:{port} using {relay_doc['kemalg']}")
