@@ -9,9 +9,9 @@ from typing import Any
 
 import oqs
 
-from .constants import DEFAULT_TIMEOUT, KEMALG
+from .constants import CELL_PAYLOAD_BYTES, DEFAULT_TIMEOUT, KEMALG
 from .crypto import decrypt_layer, derive_hop_keys, encrypt_layer
-from .models.protocol import parse_build_envelope, parse_cell_envelope, parse_destroy_envelope, parse_exit_cell_layer, parse_layer
+from .models.protocol import encode_stream_cell_payload, parse_build_envelope, parse_cell_envelope, parse_destroy_envelope, parse_exit_cell_layer, parse_layer
 from .util import atomic_write_json, b64d, b64e, load_json
 from .wire import recv_msg, send_msg
 
@@ -291,6 +291,14 @@ class RelayServer:
             f"type={reply_cell['cell_type']} payload={reply_cell['payload']!r}"
         )
         print()
+
+        reply_payload = str(reply_cell.get("payload", "")).encode("utf-8")
+        if len(reply_payload) > CELL_PAYLOAD_BYTES:
+            raise ValueError("reply payload exceeds cell budget")
+        reply_payload_b64, _pad_b64 = encode_stream_cell_payload(reply_payload, padded_len=CELL_PAYLOAD_BYTES)
+        reply_cell["padded_len"] = CELL_PAYLOAD_BYTES
+        reply_cell["payload_b64"] = reply_payload_b64
+        reply_cell["is_padding"] = False
 
         return {
             "ok": True,
@@ -676,6 +684,9 @@ class RelayServer:
                 "seq": layer.cell.seq,
                 "cell_type": layer.cell.cell_type,
                 "payload": layer.cell.payload,
+                "padded_len": layer.cell.padded_len,
+                "payload_b64": layer.cell.payload_b64,
+                "is_padding": layer.cell.is_padding,
             })
 
         return {"ok": False, "error": f"unknown circuit role {state['role']}"}

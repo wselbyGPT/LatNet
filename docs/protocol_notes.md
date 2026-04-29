@@ -79,3 +79,18 @@ Runtime summary metrics are emitted in the `metrics` field on shutdown events, i
 ## Operations documentation
 
 - `docs/operator_playbook.md` is the primary operator runbook for hidden service bootstrap, publish/rotation, troubleshooting, and alert thresholds.
+
+## Fixed-size stream cell payload format
+
+Stream cells now carry a protocol-level encoded payload envelope:
+
+- `padded_len`: required fixed payload budget in bytes (`CELL_PAYLOAD_BYTES`).
+- `payload_b64`: base64 representation of the unpadded payload bytes.
+- `is_padding` (optional): marks intentionally empty/padding-only payloads.
+
+Compatibility behavior:
+
+- Parsers accept legacy cells that only include `payload` and synthesize `payload_b64` for backward compatibility.
+- Parsers reject any `padded_len` other than the configured `CELL_PAYLOAD_BYTES`.
+- Clients/relays enforce payload byte budget pre-encryption and reject oversize payloads.
+- Padding is stripped only at the terminal consumer when decoding `payload_b64` into application `payload` text.
