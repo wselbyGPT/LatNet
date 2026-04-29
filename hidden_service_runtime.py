@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import time
 import uuid
+import random
+import threading
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -102,7 +104,50 @@ class ServiceCircuit:
     guard_port: int
     forward_keys: list[bytes]
     reverse_keys: list[bytes]
+    keepalive_scheduler: "ServiceKeepaliveScheduler | None" = None
+    keepalive_paused_until: float = 0.0
 
+
+
+
+@dataclass(frozen=True)
+class KeepaliveConfig:
+    base_interval_s: float = 15.0
+    jitter_ratio: float = 0.2
+    pause_after_real_traffic_s: float = 5.0
+
+
+DEFAULT_KEEPALIVE_CONFIG = KeepaliveConfig()
+
+
+class ServiceKeepaliveScheduler:
+    def __init__(self, circuit: ServiceCircuit, config: KeepaliveConfig = DEFAULT_KEEPALIVE_CONFIG):
+        self.circuit = circuit
+        self.config = config
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True, name=f"hs-ka-{circuit.circuit_id[:8]}")
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+
+    def note_real_traffic(self) -> None:
+        self.circuit.keepalive_paused_until = time.time() + max(0.0, self.config.pause_after_real_traffic_s)
+
+    def _run(self) -> None:
+        base = max(0.1, self.config.base_interval_s)
+        jitter = max(0.0, min(self.config.jitter_ratio, 0.95))
+        while not self._stop.wait(base * (1.0 + random.uniform(-jitter, jitter))):
+            if time.time() < self.circuit.keepalive_paused_until:
+                continue
+            try:
+                _send_circuit_cmd(self.circuit, {"cmd": "KEEPALIVE"}, is_keepalive=True)
+            except Exception:
+                continue
 
 def load_service_material(service_master_path: str, descriptor_path: str, *, now: int | None = None) -> dict[str, Any]:
     service_master = load_service_master(service_master_path)
@@ -195,16 +240,21 @@ def build_service_circuit(path_of_relays: list[dict[str, Any]], *, terminal_cmd:
     if not response.get("ok"):
         raise ProtocolMismatchError(str(response.get("error", "BUILD failed")))
 
-    return ServiceCircuit(
+    circuit = ServiceCircuit(
         circuit_id=circuit_id,
         guard_host=guard["host"],
         guard_port=int(guard["port"]),
         forward_keys=[item["forward_key"] for item in per_hop],
         reverse_keys=[item["reverse_key"] for item in per_hop],
     )
+    circuit.keepalive_scheduler = ServiceKeepaliveScheduler(circuit)
+    circuit.keepalive_scheduler.start()
+    return circuit
 
 
-def _send_circuit_cmd(circuit: ServiceCircuit, cmd: dict[str, Any]) -> dict[str, Any]:
+def _send_circuit_cmd(circuit: ServiceCircuit, cmd: dict[str, Any], *, is_keepalive: bool = False) -> dict[str, Any]:
+    if circuit.keepalive_scheduler and not is_keepalive:
+        circuit.keepalive_scheduler.note_real_traffic()
     layer = encrypt_layer(circuit.forward_keys[0], cmd)
     response = _send_guard_message(
         circuit.guard_host,

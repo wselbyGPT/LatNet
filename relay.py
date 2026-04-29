@@ -508,6 +508,15 @@ class RelayServer:
         decoded_layer = decrypt_layer(forward_key, env.layer)
         layer_cmd = decoded_layer.get("cmd") if isinstance(decoded_layer, dict) else None
 
+        if layer_cmd == "KEEPALIVE":
+            return {
+                "ok": True,
+                "reply_layer": encrypt_layer(
+                    reverse_key,
+                    {"cmd": "KEEPALIVE_ACK", "ts": time.time()},
+                ),
+            }
+
         if state["role"] == "intro":
             if layer_cmd == "INTRODUCE":
                 cookie = decoded_layer.get("rendezvous_cookie")
