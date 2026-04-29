@@ -18,6 +18,19 @@ import pathlib
 import sys
 import types
 
+try:
+    import oqs
+except Exception as exc:  # pragma: no cover - deploy-time guard
+    raise SystemExit(
+        "Missing OQS Python bindings. Install the liboqs-backed package (for example, 'pip install oqs-python') and retry."
+    ) from exc
+
+if not hasattr(oqs, 'KeyEncapsulation'):
+    raise SystemExit(
+        "Detected an incompatible 'oqs' module: KeyEncapsulation is missing. \
+Uninstall the wrong package (often installed as 'oqs') and install liboqs bindings instead (for example, 'pip install oqs-python')."
+    )
+
 root = pathlib.Path('.').resolve()
 pkg = types.ModuleType('latnet')
 pkg.__path__ = [str(root)]
