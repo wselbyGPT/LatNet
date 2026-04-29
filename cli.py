@@ -38,6 +38,7 @@ from .hidden_service_runtime import (
     HiddenServiceRuntimeError,
     ReliabilityConfig,
     ServiceCircuit,
+    TimingObfuscationConfig,
     build_intro_circuits,
     build_service_circuit,
     error_to_dict,
@@ -47,6 +48,7 @@ from .hidden_service_runtime import (
     rendezvous_close,
     rendezvous_recv,
     rendezvous_send,
+    timing_obfuscation_for_mode,
 )
 from .relay import RelayServer, init_relay_file, run_relay_server
 from .observability import EventEmitter, Metrics
@@ -154,6 +156,10 @@ def _runtime_error_output(error: Exception, **extra: Any) -> dict[str, Any]:
     return payload
 
 
+def _timing_config_from_args(args: argparse.Namespace) -> TimingObfuscationConfig:
+    return timing_obfuscation_for_mode(getattr(args, "timing_mode", "off"))
+
+
 def _error_code(error: Exception) -> str:
     details = error_to_dict(error)
     return str(details.get("code") or "unknown_error")
@@ -227,6 +233,7 @@ def _build_parser() -> argparse.ArgumentParser:
     hs_serve.add_argument("--retry-backoff-base", type=float, default=DEFAULT_RELIABILITY_CONFIG.retry_backoff_base_s, help="Retry backoff base seconds")
     hs_serve.add_argument("--retry-backoff-max", type=float, default=DEFAULT_RELIABILITY_CONFIG.retry_backoff_max_s, help="Retry backoff max seconds")
     hs_serve.add_argument("--once", action="store_true", help="Run a single poll cycle and exit")
+    hs_serve.add_argument("--timing-mode", choices=["off", "low", "high"], default="off", help="Traffic timing obfuscation mode")
 
     hs_connect = hs_sub.add_parser("connect", help="Build rendezvous flow and open HS stream")
     hs_connect.add_argument("service_name", help="Service name (*.lettuce)")
@@ -243,6 +250,7 @@ def _build_parser() -> argparse.ArgumentParser:
     hs_send = hs_sub.add_parser("send", help="Relay a message payload over persisted HS session")
     hs_send.add_argument("--session", default=".latnet-hs.json", help="HS session file")
     hs_send.add_argument("payload", help="Payload string")
+    hs_send.add_argument("--timing-mode", choices=["off", "low", "high"], default="off", help="Traffic timing obfuscation mode")
 
     hs_recv = hs_sub.add_parser("recv", help="Receive message payload from persisted HS session")
     hs_recv.add_argument("--session", default=".latnet-hs.json", help="HS session file")
@@ -251,10 +259,12 @@ def _build_parser() -> argparse.ArgumentParser:
     hs_recv.add_argument("--max-retries", type=int, default=DEFAULT_RELIABILITY_CONFIG.max_retries, help="Max retries for retriable relay errors")
     hs_recv.add_argument("--retry-backoff-base", type=float, default=DEFAULT_RELIABILITY_CONFIG.retry_backoff_base_s, help="Retry backoff base seconds")
     hs_recv.add_argument("--retry-backoff-max", type=float, default=DEFAULT_RELIABILITY_CONFIG.retry_backoff_max_s, help="Retry backoff max seconds")
+    hs_recv.add_argument("--timing-mode", choices=["off", "low", "high"], default="off", help="Traffic timing obfuscation mode")
 
     hs_end = hs_sub.add_parser("end", help="Close/finalize HS session")
     hs_end.add_argument("--session", default=".latnet-hs.json", help="HS session file")
     hs_end.add_argument("--payload", default="", help="Optional END payload")
+    hs_end.add_argument("--timing-mode", choices=["off", "low", "high"], default="off", help="Traffic timing obfuscation mode")
 
     hs_publish = hs_sub.add_parser("publish", help="Publish hidden service descriptor to directory")
     hs_publish.add_argument("--service-master", required=True, help="Hidden service master key JSON")
@@ -428,11 +438,12 @@ def main(argv: list[str] | None = None) -> int:
         emitter.emit("hs.runtime_started", status="ok", mode="service", intro_circuits=len(intro_circuits))
 
         reliability = _reliability_config_from_args(args)
+        timing = _timing_config_from_args(args)
         while True:
             handled = 0
             for intro in intro_circuits:
                 try:
-                    items = poll_intro_requests(intro["circuit"], config=reliability)
+                    items = poll_intro_requests(intro["circuit"], config=reliability, timing=timing)
                     emitter.emit("hs.intro_polled", status="ok", mode="service", poll_count=len(items))
                     for item in items:
                         result = handle_intro_request_with_echo(item, config=reliability)
@@ -575,8 +586,9 @@ def main(argv: list[str] | None = None) -> int:
             emitter.emit("hs.error", status="error", error_code="session_ended", error="session already ended")
             return 1
         circuit = _hs_circuit_from_json(session["circuit"])
+        timing = _timing_config_from_args(args)
         try:
-            reply = rendezvous_send(circuit, str(session["rendezvous_cookie"]), args.payload)
+            reply = rendezvous_send(circuit, str(session["rendezvous_cookie"]), args.payload, timing=timing)
         except Exception as exc:
             error_code = _error_code(exc)
             metrics.record_relay_failure(error_code)
@@ -605,10 +617,11 @@ def main(argv: list[str] | None = None) -> int:
             retry_backoff_base_s=max(0.0, float(args.retry_backoff_base)),
             retry_backoff_max_s=max(0.0, float(args.retry_backoff_max)),
         )
+        timing = _timing_config_from_args(args)
         deadline = time.monotonic() + max(0.0, float(args.timeout))
         try:
             while True:
-                payload = rendezvous_recv(circuit, cookie, config=reliability)
+                payload = rendezvous_recv(circuit, cookie, config=reliability, timing=timing)
                 if payload is not None:
                     emitter.emit("hs.message_received", status="ok", payload=payload, received_at=int(time.time()))
                     return 0
@@ -670,8 +683,9 @@ def main(argv: list[str] | None = None) -> int:
             emitter.emit("hs.error", status="error", error_code="session_ended", error="session already ended")
             return 1
         circuit = _hs_circuit_from_json(session["circuit"])
+        timing = _timing_config_from_args(args)
         try:
-            reply = rendezvous_close(circuit, str(session["rendezvous_cookie"]), args.payload)
+            reply = rendezvous_close(circuit, str(session["rendezvous_cookie"]), args.payload, timing=timing)
         except Exception as exc:
             error_code = _error_code(exc)
             metrics.record_relay_failure(error_code)

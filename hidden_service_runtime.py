@@ -51,6 +51,66 @@ class PaddingPolicyConfig:
     burst_limit: int = 4
 
 
+@dataclass(frozen=True)
+class TimingObfuscationConfig:
+    mode: Literal["off", "low", "high"] = "off"
+    poll_delay_min_s: float = 0.0
+    poll_delay_max_s: float = 0.0
+    rendezvous_delay_min_s: float = 0.0
+    rendezvous_delay_max_s: float = 0.0
+    latency_cap_s: float = 0.0
+    dummy_poll_chance: float = 0.0
+    dummy_recv_chance: float = 0.0
+    dummy_send_chance: float = 0.0
+
+
+def timing_obfuscation_for_mode(mode: str) -> TimingObfuscationConfig:
+    normalized = str(mode).strip().lower()
+    if normalized == "off":
+        return TimingObfuscationConfig(mode="off")
+    if normalized == "low":
+        return TimingObfuscationConfig(
+            mode="low",
+            poll_delay_min_s=0.0,
+            poll_delay_max_s=0.015,
+            rendezvous_delay_min_s=0.0,
+            rendezvous_delay_max_s=0.02,
+            latency_cap_s=0.06,
+            dummy_poll_chance=0.05,
+            dummy_recv_chance=0.03,
+            dummy_send_chance=0.02,
+        )
+    if normalized == "high":
+        return TimingObfuscationConfig(
+            mode="high",
+            poll_delay_min_s=0.01,
+            poll_delay_max_s=0.05,
+            rendezvous_delay_min_s=0.01,
+            rendezvous_delay_max_s=0.08,
+            latency_cap_s=0.12,
+            dummy_poll_chance=0.15,
+            dummy_recv_chance=0.12,
+            dummy_send_chance=0.10,
+        )
+    raise ValueError(f"unsupported timing obfuscation mode: {mode}")
+
+
+def _bounded_random_sleep(min_delay_s: float, max_delay_s: float, cap_s: float) -> None:
+    lower = max(0.0, float(min_delay_s))
+    upper = max(lower, float(max_delay_s))
+    if cap_s > 0:
+        upper = min(upper, float(cap_s))
+    if upper <= 0:
+        return
+    time.sleep(random.uniform(lower, upper))
+
+
+def _maybe_send_dummy(circuit: ServiceCircuit, chance: float) -> None:
+    if chance <= 0.0 or random.random() >= chance:
+        return
+    _send_circuit_cmd(circuit, {"cmd": "KEEPALIVE"})
+
+
 class HiddenServiceRuntimeError(Exception):
     code = "runtime_error"
     retriable = False
@@ -286,9 +346,17 @@ def build_intro_circuits(descriptor: dict[str, Any], relays_by_name: dict[str, d
     return intro_circuits
 
 
-def poll_intro_requests(intro_circuit: ServiceCircuit, *, config: ReliabilityConfig = DEFAULT_RELIABILITY_CONFIG) -> list[dict[str, Any]]:
+def poll_intro_requests(
+    intro_circuit: ServiceCircuit,
+    *,
+    config: ReliabilityConfig = DEFAULT_RELIABILITY_CONFIG,
+    timing: TimingObfuscationConfig | None = None,
+) -> list[dict[str, Any]]:
+    timing_cfg = timing or timing_obfuscation_for_mode("off")
     for attempt in range(1, config.max_retries + 1):
         try:
+            _bounded_random_sleep(timing_cfg.poll_delay_min_s, timing_cfg.poll_delay_max_s, timing_cfg.latency_cap_s)
+            _maybe_send_dummy(intro_circuit, timing_cfg.dummy_poll_chance)
             reply = _send_circuit_cmd(intro_circuit, {"cmd": "INTRO_POLL"})
             if reply.get("cmd") != "INTRO_PENDING":
                 raise ProtocolMismatchError(f"expected INTRO_PENDING, got {reply.get('cmd')}")
@@ -304,11 +372,18 @@ def poll_intro_requests(intro_circuit: ServiceCircuit, *, config: ReliabilityCon
 
 
 def establish_service_rendezvous(
-    relay_doc: dict[str, Any], rendezvous_cookie: str, *, config: ReliabilityConfig = DEFAULT_RELIABILITY_CONFIG
+    relay_doc: dict[str, Any],
+    rendezvous_cookie: str,
+    *,
+    config: ReliabilityConfig = DEFAULT_RELIABILITY_CONFIG,
+    timing: TimingObfuscationConfig | None = None,
 ) -> tuple[ServiceCircuit, bool]:
+    timing_cfg = timing or timing_obfuscation_for_mode("off")
     for attempt in range(1, config.max_retries + 1):
         try:
             circuit = build_service_circuit([relay_doc], terminal_cmd="RENDEZVOUS_READY")
+            _bounded_random_sleep(timing_cfg.rendezvous_delay_min_s, timing_cfg.rendezvous_delay_max_s, timing_cfg.latency_cap_s)
+            _maybe_send_dummy(circuit, timing_cfg.dummy_send_chance)
             reply = _send_circuit_cmd(
                 circuit,
                 {
@@ -325,7 +400,7 @@ def establish_service_rendezvous(
 
             deadline = time.monotonic() + max(0.0, config.join_timeout_s)
             while time.monotonic() < deadline:
-                payload = rendezvous_recv(circuit, rendezvous_cookie, config=config)
+                payload = rendezvous_recv(circuit, rendezvous_cookie, config=config, timing=timing_cfg)
                 if payload is not None:
                     return circuit, True
                 time.sleep(max(0.0, config.poll_interval_s))
@@ -342,10 +417,17 @@ def establish_service_rendezvous(
 
 
 def rendezvous_recv(
-    circuit: ServiceCircuit, rendezvous_cookie: str, *, config: ReliabilityConfig = DEFAULT_RELIABILITY_CONFIG
+    circuit: ServiceCircuit,
+    rendezvous_cookie: str,
+    *,
+    config: ReliabilityConfig = DEFAULT_RELIABILITY_CONFIG,
+    timing: TimingObfuscationConfig | None = None,
 ) -> str | None:
+    timing_cfg = timing or timing_obfuscation_for_mode("off")
     for attempt in range(1, config.max_retries + 1):
         try:
+            _bounded_random_sleep(timing_cfg.rendezvous_delay_min_s, timing_cfg.rendezvous_delay_max_s, timing_cfg.latency_cap_s)
+            _maybe_send_dummy(circuit, timing_cfg.dummy_recv_chance)
             reply = _send_circuit_cmd(
                 circuit,
                 {
@@ -364,7 +446,16 @@ def rendezvous_recv(
     return None
 
 
-def rendezvous_send(circuit: ServiceCircuit, rendezvous_cookie: str, payload: str) -> dict[str, Any]:
+def rendezvous_send(
+    circuit: ServiceCircuit,
+    rendezvous_cookie: str,
+    payload: str,
+    *,
+    timing: TimingObfuscationConfig | None = None,
+) -> dict[str, Any]:
+    timing_cfg = timing or timing_obfuscation_for_mode("off")
+    _bounded_random_sleep(timing_cfg.rendezvous_delay_min_s, timing_cfg.rendezvous_delay_max_s, timing_cfg.latency_cap_s)
+    _maybe_send_dummy(circuit, timing_cfg.dummy_send_chance)
     return _send_circuit_cmd(
         circuit,
         {
@@ -375,8 +466,14 @@ def rendezvous_send(circuit: ServiceCircuit, rendezvous_cookie: str, payload: st
     )
 
 
-def rendezvous_close(circuit: ServiceCircuit, rendezvous_cookie: str, final_payload: str = "") -> dict[str, Any]:
-    return rendezvous_send(circuit, rendezvous_cookie, final_payload)
+def rendezvous_close(
+    circuit: ServiceCircuit,
+    rendezvous_cookie: str,
+    final_payload: str = "",
+    *,
+    timing: TimingObfuscationConfig | None = None,
+) -> dict[str, Any]:
+    return rendezvous_send(circuit, rendezvous_cookie, final_payload, timing=timing)
 
 
 def handle_intro_request_with_echo(
@@ -437,6 +534,7 @@ __all__ = [
     "RelayUnreachableError",
     "RendezvousNotJoinedError",
     "ServiceCircuit",
+    "TimingObfuscationConfig",
     "TimeoutRuntimeError",
     "build_intro_circuits",
     "build_service_circuit",
@@ -448,4 +546,5 @@ __all__ = [
     "rendezvous_close",
     "rendezvous_recv",
     "rendezvous_send",
+    "timing_obfuscation_for_mode",
 ]

@@ -259,6 +259,32 @@ def test_establish_service_rendezvous_retry_exhaustion(monkeypatch, latnet_modul
     assert sleeps == [0.1, 0.2]
 
 
+def test_poll_intro_requests_timing_mode_low_emits_dummy(monkeypatch, latnet_modules):
+    runtime = latnet_modules["hidden_service_runtime"]
+    circuit = runtime.ServiceCircuit("c1", "127.0.0.1", 1, [b"f"], [b"r"])
+    commands: list[str] = []
+    sleeps: list[float] = []
+    values = iter([0.0, 0.0])
+
+    def _fake_send(_circuit, cmd):
+        commands.append(str(cmd["cmd"]))
+        if cmd["cmd"] == "INTRO_POLL":
+            return {"cmd": "INTRO_PENDING", "items": []}
+        return {"cmd": "OK"}
+
+    monkeypatch.setattr(runtime, "_send_circuit_cmd", _fake_send)
+    monkeypatch.setattr(runtime.random, "random", lambda: next(values))
+    monkeypatch.setattr(runtime.random, "uniform", lambda a, b: b)
+    monkeypatch.setattr(runtime.time, "sleep", lambda v: sleeps.append(v))
+    timing = runtime.timing_obfuscation_for_mode("low")
+
+    result = runtime.poll_intro_requests(circuit, timing=timing)
+
+    assert result == []
+    assert commands == ["KEEPALIVE", "INTRO_POLL"]
+    assert sleeps and sleeps[0] <= timing.latency_cap_s
+
+
 def test_establish_service_rendezvous_succeeds_when_payload_arrives_before_deadline(monkeypatch, latnet_modules):
     runtime = latnet_modules["hidden_service_runtime"]
     circuit = runtime.ServiceCircuit("c1", "127.0.0.1", 1, [b"f"], [b"r"])
@@ -272,7 +298,7 @@ def test_establish_service_rendezvous_succeeds_when_payload_arrives_before_deadl
     recv_payloads = [None, None, "payload-before-deadline"]
     recv_calls: list[str] = []
 
-    def _fake_recv(_circuit, rendezvous_cookie, *, config):
+    def _fake_recv(_circuit, rendezvous_cookie, *, config, timing=None):
         recv_calls.append(rendezvous_cookie)
         return recv_payloads.pop(0)
 
