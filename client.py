@@ -4,6 +4,8 @@ import time
 import uuid
 import os
 import json
+import random
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -64,6 +66,9 @@ class CircuitSession:
     hops: list[HopSession]
     stream_next_seq: dict[int, int] = field(default_factory=dict)
     cell_batcher: "CircuitCellBatcher | None" = None
+    keepalive_scheduler: "CircuitKeepaliveScheduler | None" = None
+    keepalive_paused_until: float = 0.0
+    last_real_traffic_at: float = field(default_factory=time.time)
 
 
 @dataclass(frozen=True)
@@ -73,6 +78,52 @@ class PaddingPolicyConfig:
     max_interval_s: float = 2.0
     burst_limit: int = 4
 
+
+
+
+@dataclass(frozen=True)
+class KeepaliveConfig:
+    base_interval_s: float = 15.0
+    jitter_ratio: float = 0.2
+    pause_after_real_traffic_s: float = 5.0
+
+
+DEFAULT_KEEPALIVE_CONFIG = KeepaliveConfig()
+
+
+class CircuitKeepaliveScheduler:
+    def __init__(self, circuit: CircuitSession, config: KeepaliveConfig = DEFAULT_KEEPALIVE_CONFIG):
+        self.circuit = circuit
+        self.config = config
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name=f"keepalive-{circuit.circuit_id[:8]}", daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+
+    def note_real_traffic(self) -> None:
+        now = time.time()
+        self.circuit.last_real_traffic_at = now
+        self.circuit.keepalive_paused_until = now + max(0.0, self.config.pause_after_real_traffic_s)
+
+    def _next_interval(self) -> float:
+        base = max(0.1, self.config.base_interval_s)
+        jitter = max(0.0, min(self.config.jitter_ratio, 0.95))
+        return base * (1.0 + random.uniform(-jitter, jitter))
+
+    def _run(self) -> None:
+        while not self._stop.wait(self._next_interval()):
+            if time.time() < self.circuit.keepalive_paused_until:
+                continue
+            try:
+                _send_batched_cells(self.circuit, include_current={"stream_id": 0, "seq": 0, "cell_type": "PADDING", "payload": ""}, force_flush=True)
+            except Exception:
+                continue
 
 @dataclass
 class _QueuedCell:
@@ -487,7 +538,7 @@ def build_circuit(path_of_relays: list[dict[str, Any]], circuit_id: str | None =
     if not response.get("ok"):
         raise ValueError(response.get("error", "BUILD failed"))
 
-    return CircuitSession(
+    circuit = CircuitSession(
         circuit_id=circuit_id,
         guard_host=guard["host"],
         guard_port=int(guard["port"]),
@@ -502,6 +553,9 @@ def build_circuit(path_of_relays: list[dict[str, Any]], circuit_id: str | None =
             for item in per_hop
         ],
     )
+    circuit.keepalive_scheduler = CircuitKeepaliveScheduler(circuit)
+    circuit.keepalive_scheduler.start()
+    return circuit
 
 
 
@@ -526,6 +580,10 @@ def _wrap_forward_cell(circuit: CircuitSession, cell: dict[str, Any]) -> dict[st
 
 def build_padding_cell(stream_id: int, seq: int = 0) -> dict[str, Any]:
     return {"stream_id": stream_id, "seq": seq, "cell_type": "PADDING", "payload": ""}
+
+
+def build_keepalive_cell() -> dict[str, Any]:
+    return {"stream_id": 0, "seq": 0, "cell_type": "PADDING", "payload": ""}
 
 
 
@@ -604,6 +662,8 @@ def _send_batched_cells(
 
 def open_stream(circuit: CircuitSession, stream_id: int, target: str = "") -> dict[str, Any]:
     cell = {"stream_id": stream_id, "seq": 1, "cell_type": "BEGIN", "payload": target}
+    if circuit.keepalive_scheduler:
+        circuit.keepalive_scheduler.note_real_traffic()
     reply_cells = _send_batched_cells(circuit, include_current=cell, force_flush=True)
     if not reply_cells:
         raise ValueError("missing BEGIN reply")
@@ -619,6 +679,8 @@ def send_stream_data(circuit: CircuitSession, stream_id: int, payload: str) -> d
     if seq is None:
         raise ValueError(f"stream {stream_id} is not open")
     cell = {"stream_id": stream_id, "seq": seq, "cell_type": "DATA", "payload": payload}
+    if circuit.keepalive_scheduler:
+        circuit.keepalive_scheduler.note_real_traffic()
     reply_cells = _send_batched_cells(circuit, include_current=cell, force_flush=True)
     if not reply_cells:
         raise ValueError("missing DATA reply")
@@ -634,6 +696,8 @@ def end_stream(circuit: CircuitSession, stream_id: int, payload: str = "") -> di
     if seq is None:
         raise ValueError(f"stream {stream_id} is not open")
     cell = {"stream_id": stream_id, "seq": seq, "cell_type": "END", "payload": payload}
+    if circuit.keepalive_scheduler:
+        circuit.keepalive_scheduler.note_real_traffic()
     reply_cells = _send_batched_cells(circuit, include_current=cell, force_flush=True)
     if not reply_cells:
         raise ValueError("missing END reply")
@@ -645,6 +709,9 @@ def end_stream(circuit: CircuitSession, stream_id: int, payload: str = "") -> di
 
 
 def destroy_circuit(circuit: CircuitSession) -> dict[str, Any]:
+    if circuit.keepalive_scheduler:
+        circuit.keepalive_scheduler.stop()
+        circuit.keepalive_scheduler = None
     _send_batched_cells(circuit, force_flush=True)
     response = _send_guard_message(
         circuit.guard_host,
@@ -699,4 +766,7 @@ __all__ = [
     "CircuitSession",
     "PaddingPolicyConfig",
     "build_padding_cell",
+    "build_keepalive_cell",
+    "KeepaliveConfig",
 ]
+
