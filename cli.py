@@ -175,6 +175,11 @@ def _build_parser() -> argparse.ArgumentParser:
     circuit_build.add_argument("--relay-names", nargs="+", default=None, help="Relay names from verified snapshot in guard->exit order")
     circuit_build.add_argument("--policy", choices=["ordered", "first_valid"], default="ordered", help="Path selection policy for verified relays")
     circuit_build.add_argument("--middle-count", type=int, default=1, help="Number of middle hops when using policy selection mode")
+    circuit_build.add_argument("--guard-weight-multiplier", type=float, default=1.0, help="Guard role effective-weight multiplier")
+    circuit_build.add_argument("--middle-weight-multiplier", type=float, default=1.0, help="Middle role effective-weight multiplier")
+    circuit_build.add_argument("--exit-weight-multiplier", type=float, default=1.0, help="Exit role effective-weight multiplier")
+    circuit_build.add_argument("--min-reliability-cutoff", type=float, default=0.0, help="Minimum relay reliability score to receive non-zero effective weight")
+    circuit_build.add_argument("--selection-seed", type=int, default=None, help="Optional deterministic seed for policy-based relay selection")
     circuit_build.add_argument("--trust-config", default=None, help="Trust config JSON file path")
     circuit_build.add_argument("--trusted-authority", action="append", default=[], help="Trusted authority as authority_id=public_key")
     circuit_build.add_argument("--min-signers", type=int, default=None, help="Threshold min_signers policy override")
@@ -323,6 +328,13 @@ def main(argv: list[str] | None = None) -> int:
             selection_state = {
                 "relay_names": args.relay_names,
                 "middle_count": args.middle_count,
+                "rng_seed": args.selection_seed,
+                "policy_config": {
+                    "guard_weight_multiplier": args.guard_weight_multiplier,
+                    "middle_weight_multiplier": args.middle_weight_multiplier,
+                    "exit_weight_multiplier": args.exit_weight_multiplier,
+                    "min_reliability_cutoff": args.min_reliability_cutoff,
+                },
             }
             selected_relays = select_path(candidate_relays, policy=policy, state=selection_state)
             circuit = build_circuit(selected_relays, circuit_id=args.circuit_id)

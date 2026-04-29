@@ -60,6 +60,28 @@ def _req_int(src: dict[str, Any], field: str, *, context: str) -> int:
     return value
 
 
+def _opt_number(src: dict[str, Any], field: str, *, context: str) -> float | int | None:
+    value = src.get(field)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{context} has invalid field type: {field}")
+    return value
+
+
+def _validate_snapshot(snapshot: dict[str, Any]) -> None:
+    descriptors = snapshot.get("descriptors")
+    if not isinstance(descriptors, list):
+        raise ValueError("network status snapshot missing or invalid field: descriptors")
+    for item in descriptors:
+        descriptor = _as_dict(item, context="network status descriptor")
+        signed = _as_dict(descriptor.get("signed"), context="network status descriptor signed")
+        relay = _as_dict(signed.get("relay"), context="network status relay")
+        _req_str(relay, "name", context="network status relay")
+        _opt_number(relay, "capacity_weight", context="network status relay")
+        _opt_number(relay, "reliability_score", context="network status relay")
+
+
 def parse_network_status_document(obj: Any) -> NetworkStatusDocument:
     src = _as_dict(obj, context="network status")
     version = _req_int(src, "version", context="network status")
@@ -67,6 +89,7 @@ def parse_network_status_document(obj: Any) -> NetworkStatusDocument:
         raise ValueError(f"unsupported network status version {version}")
 
     snapshot = _as_dict(src.get("snapshot"), context="network status snapshot")
+    _validate_snapshot(snapshot)
     snapshot_hash = _req_str(src, "snapshot_hash", context="network status")
 
     validity_src = _as_dict(src.get("validity"), context="network status validity")
