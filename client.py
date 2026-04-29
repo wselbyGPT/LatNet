@@ -539,15 +539,15 @@ def _send_guard_message(host: str, port: int, msg: dict[str, Any]) -> dict[str, 
 
 
 
-def _encapsulate_for_hop(hop: dict[str, Any], circuit_id: str) -> tuple[str, bytes, bytes]:
+def _encapsulate_for_hop(hop: dict[str, Any], circuit_id: str, isolation_context: bytes = b"") -> tuple[str, bytes, bytes]:
     with oqs.KeyEncapsulation(hop["kemalg"]) as kem:
         ct, shared_secret = kem.encap_secret(b64d(hop["public_key"]))
-    forward_key, reverse_key = derive_hop_keys(shared_secret, circuit_id, hop["name"])
+    forward_key, reverse_key = derive_hop_keys(shared_secret, circuit_id, hop["name"], isolation_context=isolation_context)
     return b64e(ct), forward_key, reverse_key
 
 
 
-def build_circuit(path_of_relays: list[dict[str, Any]], circuit_id: str | None = None) -> CircuitSession:
+def build_circuit(path_of_relays: list[dict[str, Any]], circuit_id: str | None = None, *, isolation_context: bytes = b"") -> CircuitSession:
     if len(path_of_relays) < 1:
         raise ValueError("path_of_relays must contain at least one relay")
 
@@ -555,7 +555,7 @@ def build_circuit(path_of_relays: list[dict[str, Any]], circuit_id: str | None =
 
     per_hop: list[dict[str, Any]] = []
     for hop in path_of_relays:
-        ct_b64, forward_key, reverse_key = _encapsulate_for_hop(hop, circuit_id)
+        ct_b64, forward_key, reverse_key = _encapsulate_for_hop(hop, circuit_id, isolation_context=isolation_context)
         per_hop.append({
             "hop": hop,
             "ct": ct_b64,
@@ -589,6 +589,7 @@ def build_circuit(path_of_relays: list[dict[str, Any]], circuit_id: str | None =
             "circuit_id": circuit_id,
             "ct": per_hop[0]["ct"],
             "layer": inner_wrapped,
+            "kdf_ctx_b64": b64e(isolation_context),
         },
     )
     if not response.get("ok"):

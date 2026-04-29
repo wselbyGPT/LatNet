@@ -214,10 +214,10 @@ class RelayServer:
             stream_state["inbound_queue_bytes"] = max(0, int(stream_state.get("inbound_queue_bytes", 0)) - len(data))
             return data
         return produced
-    def relay_decap_and_keys(self, ct_b64: str, circuit_id: str) -> tuple[bytes, bytes]:
+    def relay_decap_and_keys(self, ct_b64: str, circuit_id: str, isolation_context: bytes = b"") -> tuple[bytes, bytes]:
         with oqs.KeyEncapsulation(self.relay_doc["kemalg"], b64d(self.relay_doc["secret_key"])) as kem:
             shared_secret = kem.decap_secret(b64d(ct_b64))
-        return derive_hop_keys(shared_secret, circuit_id, self.relay_doc["name"])
+        return derive_hop_keys(shared_secret, circuit_id, self.relay_doc["name"], isolation_context=isolation_context)
 
     def wrap_reverse_hop(self, reverse_key: bytes, next_response: dict[str, Any]) -> dict[str, Any]:
         if not next_response.get("ok"):
@@ -576,7 +576,9 @@ class RelayServer:
         self.cleanup_stale_state()
         env = parse_build_envelope(msg)
         circuit_id = env.circuit_id
-        forward_key, reverse_key = self.relay_decap_and_keys(env.ct, circuit_id)
+        kdf_ctx_b64 = msg.get("kdf_ctx_b64", "")
+        kdf_ctx = b64d(kdf_ctx_b64) if isinstance(kdf_ctx_b64, str) and kdf_ctx_b64 else b""
+        forward_key, reverse_key = self.relay_decap_and_keys(env.ct, circuit_id, isolation_context=kdf_ctx)
         layer = parse_layer(decrypt_layer(forward_key, env.layer))
 
         if layer.cmd == "FORWARD_BUILD":
@@ -595,6 +597,7 @@ class RelayServer:
                 "circuit_id": circuit_id,
                 "ct": layer.next_ct,
                 "layer": layer.inner,
+                "kdf_ctx_b64": kdf_ctx_b64,
             }
             response = self.forward_to_next(state, next_build)
             if response.get("ok"):

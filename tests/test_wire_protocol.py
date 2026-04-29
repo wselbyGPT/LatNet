@@ -52,3 +52,16 @@ def test_recv_msg_raises_on_invalid_json_payload(latnet_modules):
     finally:
         left.close()
         right.close()
+
+
+def test_hop_key_derivation_changes_with_isolation_context(latnet_modules):
+    crypto = latnet_modules["crypto"]
+    secret = b"same-secret"
+    circuit_id = "c1"
+    hop_name = "relay-a"
+
+    f1, r1 = crypto.derive_hop_keys(secret, circuit_id, hop_name, isolation_context=b"hs:service:a")
+    f2, r2 = crypto.derive_hop_keys(secret, circuit_id, hop_name, isolation_context=b"hs:service:b")
+
+    assert f1 != f2
+    assert r1 != r2

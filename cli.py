@@ -60,6 +60,19 @@ def _load_relays(paths: list[str]) -> list[dict[str, Any]]:
     return [load_json(path) for path in paths]
 
 
+def _hs_isolation_context(mode: str, *, service_name: str | None = None) -> bytes:
+    normalized = str(mode or "global")
+    if normalized == "global":
+        return b"hs:global"
+    if normalized == "per_service":
+        return f"hs:service:{service_name or ''}".encode("utf-8")
+    if normalized == "per_client":
+        return b"hs:client:default"
+    if normalized == "per_client_per_service":
+        return f"hs:client:default|service:{service_name or ''}".encode("utf-8")
+    raise ValueError(f"unknown isolation mode: {mode}")
+
+
 def _session_to_json(circuit: CircuitSession) -> dict[str, Any]:
     return {
         "circuit_id": circuit.circuit_id,
@@ -234,6 +247,7 @@ def _build_parser() -> argparse.ArgumentParser:
     hs_serve.add_argument("--retry-backoff-max", type=float, default=DEFAULT_RELIABILITY_CONFIG.retry_backoff_max_s, help="Retry backoff max seconds")
     hs_serve.add_argument("--once", action="store_true", help="Run a single poll cycle and exit")
     hs_serve.add_argument("--timing-mode", choices=["off", "low", "high"], default="off", help="Traffic timing obfuscation mode")
+    hs_serve.add_argument("--isolation-mode", choices=["global", "per_service", "per_client", "per_client_per_service"], default="per_client_per_service", help="HS key derivation isolation mode")
 
     hs_connect = hs_sub.add_parser("connect", help="Build rendezvous flow and open HS stream")
     hs_connect.add_argument("service_name", help="Service name (*.lettuce)")
@@ -246,6 +260,7 @@ def _build_parser() -> argparse.ArgumentParser:
     hs_connect.add_argument("--min-signers", type=int, default=None, help="Threshold min_signers policy override")
     hs_connect.add_argument("--authority-set-version", type=int, default=None, help="Optional authority set epoch/version")
     hs_connect.add_argument("--allow-legacy-single-authority", action="store_true", help="Lab-only escape hatch for unsigned legacy bundle")
+    hs_connect.add_argument("--isolation-mode", choices=["global", "per_service", "per_client", "per_client_per_service"], default="per_client_per_service", help="HS key derivation isolation mode")
 
     hs_send = hs_sub.add_parser("send", help="Relay a message payload over persisted HS session")
     hs_send.add_argument("--session", default=".latnet-hs.json", help="HS session file")
@@ -434,7 +449,8 @@ def main(argv: list[str] | None = None) -> int:
         metrics = Metrics()
         relays = _load_relays(args.relays)
         relays_by_name = {str(relay["name"]): relay for relay in relays}
-        intro_circuits = build_intro_circuits(service_material["descriptor"], relays_by_name)
+        isolation_context = _hs_isolation_context(args.isolation_mode, service_name=parsed_descriptor.service_name)
+        intro_circuits = build_intro_circuits(service_material["descriptor"], relays_by_name, isolation_context=isolation_context)
         emitter.emit("hs.runtime_started", status="ok", mode="service", intro_circuits=len(intro_circuits))
 
         reliability = _reliability_config_from_args(args)
@@ -504,8 +520,9 @@ def main(argv: list[str] | None = None) -> int:
             "public_key": verified_intro["public_key"] if verified_relays is not None else relay_doc["public_key"],
         }
 
-        intro_circuit = build_service_circuit([intro_relay], terminal_cmd="INTRO_READY")
-        rendezvous_circuit = build_service_circuit([relay_doc], terminal_cmd="RENDEZVOUS_READY")
+        isolation_context = _hs_isolation_context(args.isolation_mode, service_name=args.service_name)
+        intro_circuit = build_service_circuit([intro_relay], terminal_cmd="INTRO_READY", isolation_context=isolation_context)
+        rendezvous_circuit = build_service_circuit([relay_doc], terminal_cmd="RENDEZVOUS_READY", isolation_context=isolation_context)
         emitter = EventEmitter(
             component="hs.client",
             service_name=args.service_name,

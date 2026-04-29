@@ -241,10 +241,10 @@ def _send_guard_message(host: str, port: int, msg: dict[str, Any]) -> dict[str, 
     return response
 
 
-def _encapsulate_for_hop(hop: dict[str, Any], circuit_id: str) -> tuple[str, bytes, bytes]:
+def _encapsulate_for_hop(hop: dict[str, Any], circuit_id: str, isolation_context: bytes = b"") -> tuple[str, bytes, bytes]:
     with oqs.KeyEncapsulation(hop["kemalg"]) as kem:
         ct, shared_secret = kem.encap_secret(b64d(hop["public_key"]))
-    forward_key, reverse_key = derive_hop_keys(shared_secret, circuit_id, hop["name"])
+    forward_key, reverse_key = derive_hop_keys(shared_secret, circuit_id, hop["name"], isolation_context=isolation_context)
     return b64e(ct), forward_key, reverse_key
 
 
@@ -252,7 +252,7 @@ def _retry_delay(attempt: int, config: ReliabilityConfig) -> float:
     return min(config.retry_backoff_max_s, config.retry_backoff_base_s * (2 ** max(0, attempt - 1)))
 
 
-def build_service_circuit(path_of_relays: list[dict[str, Any]], *, terminal_cmd: str, circuit_id: str | None = None) -> ServiceCircuit:
+def build_service_circuit(path_of_relays: list[dict[str, Any]], *, terminal_cmd: str, circuit_id: str | None = None, isolation_context: bytes = b"") -> ServiceCircuit:
     if len(path_of_relays) < 1:
         raise ValueError("path_of_relays must contain at least one relay")
     if terminal_cmd not in {"INTRO_READY", "RENDEZVOUS_READY"}:
@@ -262,7 +262,7 @@ def build_service_circuit(path_of_relays: list[dict[str, Any]], *, terminal_cmd:
 
     per_hop: list[dict[str, Any]] = []
     for hop in path_of_relays:
-        ct_b64, forward_key, reverse_key = _encapsulate_for_hop(hop, circuit_id)
+        ct_b64, forward_key, reverse_key = _encapsulate_for_hop(hop, circuit_id, isolation_context=isolation_context)
         per_hop.append({
             "hop": hop,
             "ct": ct_b64,
@@ -296,6 +296,7 @@ def build_service_circuit(path_of_relays: list[dict[str, Any]], *, terminal_cmd:
             "circuit_id": circuit_id,
             "ct": per_hop[0]["ct"],
             "layer": inner_wrapped,
+            "kdf_ctx_b64": b64e(isolation_context),
         },
     )
     if not response.get("ok"):
@@ -331,14 +332,14 @@ def _send_circuit_cmd(circuit: ServiceCircuit, cmd: dict[str, Any], *, is_keepal
     return decrypt_layer(circuit.reverse_keys[0], reply_layer)
 
 
-def build_intro_circuits(descriptor: dict[str, Any], relays_by_name: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+def build_intro_circuits(descriptor: dict[str, Any], relays_by_name: dict[str, dict[str, Any]], *, isolation_context: bytes = b"") -> list[dict[str, Any]]:
     parsed = verify_hidden_service_descriptor_v2(descriptor)
     intro_circuits: list[dict[str, Any]] = []
     for point in parsed.introduction_points:
         relay_doc = relays_by_name.get(point.relay_name)
         if not relay_doc:
             continue
-        circuit = build_service_circuit([relay_doc], terminal_cmd="INTRO_READY")
+        circuit = build_service_circuit([relay_doc], terminal_cmd="INTRO_READY", isolation_context=isolation_context)
         intro_circuits.append({
             "intro_point": point,
             "relay": relay_doc,
@@ -378,11 +379,12 @@ def establish_service_rendezvous(
     *,
     config: ReliabilityConfig = DEFAULT_RELIABILITY_CONFIG,
     timing: TimingObfuscationConfig | None = None,
+    isolation_context: bytes = b"",
 ) -> tuple[ServiceCircuit, bool]:
     timing_cfg = timing or timing_obfuscation_for_mode("off")
     for attempt in range(1, config.max_retries + 1):
         try:
-            circuit = build_service_circuit([relay_doc], terminal_cmd="RENDEZVOUS_READY")
+            circuit = build_service_circuit([relay_doc], terminal_cmd="RENDEZVOUS_READY", isolation_context=isolation_context)
             _bounded_random_sleep(timing_cfg.rendezvous_delay_min_s, timing_cfg.rendezvous_delay_max_s, timing_cfg.latency_cap_s)
             _maybe_send_dummy(circuit, timing_cfg.dummy_send_chance)
             reply = _send_circuit_cmd(
