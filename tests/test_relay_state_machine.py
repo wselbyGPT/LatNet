@@ -109,6 +109,38 @@ def test_exit_begin_data_end_transitions(latnet_modules, relay_doc_fixture, mock
     assert data_after_end_cell["cell_type"] == "ERROR"
 
 
+def test_exit_padding_fast_path_is_stateless(latnet_modules, relay_doc_fixture, mock_key_material):
+    relay_mod = latnet_modules["relay"]
+    crypto_mod = latnet_modules["crypto"]
+
+    server = relay_mod.RelayServer(relay_doc_fixture)
+    circuit_id = "c-pad"
+    initial_state = {
+        "role": "exit",
+        "forward_key": mock_key_material["forward_b64"],
+        "reverse_key": mock_key_material["reverse_b64"],
+        "streams": {},
+        "lifecycle_state": "ready",
+        "created_at": time.time(),
+        "last_activity_at": time.time(),
+    }
+    server.set_circuit_state(circuit_id, dict(initial_state))
+
+    response = server.handle_cell(
+        _exit_cell_msg(
+            crypto_mod,
+            mock_key_material["forward"],
+            circuit_id,
+            {"stream_id": 99, "seq": 10, "cell_type": "PADDING", "payload": ""},
+        )
+    )
+    reply_cell = _decrypt_reply(crypto_mod, mock_key_material["reverse"], response)
+    assert reply_cell["cell_type"] == "PADDING"
+    assert reply_cell["is_padding"] is True
+    assert reply_cell["payload"] == ""
+    assert server.circuit_snapshot(circuit_id)["streams"] == {}
+
+
 def test_exit_rejects_replayed_data_and_end(latnet_modules, relay_doc_fixture, mock_key_material):
     relay_mod = latnet_modules["relay"]
     crypto_mod = latnet_modules["crypto"]
