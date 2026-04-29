@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import socket
+import random
 import time
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,8 @@ from .models.protocol import (
     parse_publish_hidden_service_descriptor_request,
 )
 from .util import atomic_write_json, load_json
+from .rate_limit import FixedWindowRateLimiter
+from .observability import Metrics
 from . import wire
 
 
@@ -24,10 +27,27 @@ class DirectoryServer:
         bundle_path: str,
         hidden_service_store_path: str | None = None,
         network_status_path: str | None = None,
+        *,
+        descriptor_fetch_rate_limit: int = 10,
+        descriptor_fetch_window_seconds: float = 10.0,
+        descriptor_not_found_jitter_seconds: float = 0.0,
     ):
         self.bundle_path = Path(bundle_path)
         self.hidden_service_store_path = Path(hidden_service_store_path) if hidden_service_store_path else None
         self.network_status_path = Path(network_status_path) if network_status_path else None
+        self.descriptor_fetch_limiter = FixedWindowRateLimiter(descriptor_fetch_rate_limit, descriptor_fetch_window_seconds)
+        self.descriptor_not_found_jitter_seconds = max(float(descriptor_not_found_jitter_seconds), 0.0)
+        self.metrics = Metrics()
+
+    @staticmethod
+    def _conn_identity(conn: socket.socket) -> str:
+        try:
+            peer = conn.getpeername()
+            if isinstance(peer, tuple) and peer:
+                return str(peer[0])
+        except OSError:
+            pass
+        return f"fd:{conn.fileno()}"
 
     def current_bundle(self) -> dict[str, Any]:
         return load_json(self.bundle_path)
@@ -160,9 +180,36 @@ class DirectoryServer:
             elif msg.get("type") == "GET_HS_DESCRIPTOR":
                 service_name = parse_get_hidden_service_descriptor_request(msg)
                 parse_lettuce_name(service_name)
+                key = self._conn_identity(conn)
+                allowed, retry_after = self.descriptor_fetch_limiter.allow(key)
+                if not allowed:
+                    self.metrics.record_rate_limited(
+                        "descriptor_fetch_rate_limited",
+                        window_label=f"descriptor_fetch/{int(self.descriptor_fetch_limiter.window_seconds)}s",
+                    )
+                    wire.send_msg(
+                        conn,
+                        {
+                            "ok": False,
+                            "error_class": "rate_limited",
+                            "error": "descriptor fetch request budget exceeded",
+                            "retry_after_seconds": retry_after,
+                            "service_name": service_name,
+                        },
+                    )
+                    return
                 descriptor = self.current_hidden_service_descriptors().get(service_name)
                 if descriptor is None:
-                    wire.send_msg(conn, {"ok": False, "error": f"hidden service descriptor not found: {service_name}"})
+                    if self.descriptor_not_found_jitter_seconds > 0:
+                        time.sleep(random.uniform(0.0, self.descriptor_not_found_jitter_seconds))
+                    wire.send_msg(
+                        conn,
+                        {
+                            "ok": False,
+                            "error_class": "not_found",
+                            "error": "hidden service descriptor not found",
+                        },
+                    )
                 else:
                     wire.send_msg(conn, {"ok": True, "service_name": service_name, "descriptor": descriptor})
             elif msg.get("type") == "PUBLISH_HS_DESCRIPTOR":

@@ -15,6 +15,8 @@ from .exit_connector import DemoOutboundConnector, EgressPolicyError, ExitPolicy
 from .models.protocol import encode_stream_cell_payload, parse_build_envelope, parse_cell_envelope, parse_destroy_envelope, parse_exit_cell_layer, parse_layer
 from .util import atomic_write_json, b64d, b64e, load_json
 from .wire import recv_msg, send_msg
+from .rate_limit import FixedWindowRateLimiter
+from .observability import Metrics
 
 
 def init_relay_file(name: str, host: str, port: int, out_path: str | Path) -> dict[str, Any]:
@@ -51,6 +53,9 @@ class RelayServer:
         stream_queue_high_water_bytes: int = 64 * 1024,
         stream_queue_low_water_bytes: int = 16 * 1024,
         connector_io_timeout_seconds: float = 0.25,
+        intro_poll_rate_limit: int = 5,
+        intro_poll_window_seconds: float = 5.0,
+        intro_poll_items_page_size: int = 0,
     ):
         self.relay_doc = relay_doc
         self.circuits: dict[str, dict[str, Any]] = {}
@@ -72,6 +77,9 @@ class RelayServer:
             if enable_real_egress
             else DemoOutboundConnector()
         )
+        self.intro_poll_limiter = FixedWindowRateLimiter(intro_poll_rate_limit, intro_poll_window_seconds)
+        self.intro_poll_items_page_size = max(int(intro_poll_items_page_size), 0)
+        self.metrics = Metrics()
 
     @staticmethod
     def _touch_state(state: dict[str, Any], now: float | None = None) -> None:
@@ -703,6 +711,25 @@ class RelayServer:
                 }
 
             if layer_cmd == "INTRO_POLL":
+                poll_key = f"{circuit_id}:{str(decoded_layer.get('rendezvous_cookie_prefix') or '')}"
+                allowed, retry_after = self.intro_poll_limiter.allow(poll_key)
+                if not allowed:
+                    self.metrics.record_rate_limited(
+                        "intro_poll_rate_limited",
+                        window_label=f"intro_poll/{int(self.intro_poll_limiter.window_seconds)}s",
+                    )
+                    return {
+                        "ok": False,
+                        "reply_layer": encrypt_layer(
+                            reverse_key,
+                            {
+                                "cmd": "INTRO_RATE_LIMITED",
+                                "error_class": "rate_limited",
+                                "retry_after_seconds": retry_after,
+                            },
+                        ),
+                    }
+                cookie_prefix = decoded_layer.get("rendezvous_cookie_prefix")
                 with self.lock:
                     pending = [
                         {
@@ -710,7 +737,10 @@ class RelayServer:
                             "introduction": intro.get("intro_payload"),
                         }
                         for cookie, intro in self.pending_introductions.items()
+                        if not cookie_prefix or str(cookie).startswith(str(cookie_prefix))
                     ]
+                    if self.intro_poll_items_page_size > 0:
+                        pending = pending[: self.intro_poll_items_page_size]
                     for entry in pending:
                         self.pending_introductions.pop(entry["rendezvous_cookie"], None)
                 return {

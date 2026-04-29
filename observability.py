@@ -13,6 +13,9 @@ class Metrics:
     rendezvous_join_failure: int = 0
     join_latency_ms: list[float] = field(default_factory=list)
     relay_command_failures_by_type: dict[str, int] = field(default_factory=dict)
+    descriptor_fetch_rate_limited: int = 0
+    intro_poll_rate_limited: int = 0
+    rate_limit_windows: dict[str, int] = field(default_factory=dict)
 
     def record_intro_request(self) -> None:
         self.intro_requests_handled += 1
@@ -29,6 +32,13 @@ class Metrics:
         key = str(error_code or "unknown_error")
         self.relay_command_failures_by_type[key] = self.relay_command_failures_by_type.get(key, 0) + 1
 
+    def record_rate_limited(self, counter: str, *, window_label: str) -> None:
+        if counter == "descriptor_fetch_rate_limited":
+            self.descriptor_fetch_rate_limited += 1
+        elif counter == "intro_poll_rate_limited":
+            self.intro_poll_rate_limited += 1
+        self.rate_limit_windows[window_label] = self.rate_limit_windows.get(window_label, 0) + 1
+
     def as_dict(self) -> dict[str, Any]:
         avg_join_latency_ms = (
             sum(self.join_latency_ms) / len(self.join_latency_ms) if self.join_latency_ms else None
@@ -40,6 +50,9 @@ class Metrics:
             "join_latency_count": len(self.join_latency_ms),
             "join_latency_avg_ms": avg_join_latency_ms,
             "relay_command_failures_by_type": dict(sorted(self.relay_command_failures_by_type.items())),
+            "descriptor_fetch_rate_limited": self.descriptor_fetch_rate_limited,
+            "intro_poll_rate_limited": self.intro_poll_rate_limited,
+            "rate_limit_windows": dict(sorted(self.rate_limit_windows.items())),
         }
 
 
