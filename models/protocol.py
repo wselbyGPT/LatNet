@@ -3,6 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from ..constants import CELL_PAYLOAD_BYTES
+from ..util import b64d, b64e
+
 TRUST_BUNDLE_PROTOCOL_VERSION = 1
 TRUST_STATUS_PROTOCOL_VERSION = 2
 
@@ -119,12 +122,29 @@ class StreamCell:
     seq: int
     cell_type: StreamCellType
     payload: str = ""
+    padded_len: int = CELL_PAYLOAD_BYTES
+    payload_b64: str = ""
+    is_padding: bool = False
 
 
 @dataclass(frozen=True)
 class ExitCellLayer:
     cmd: Literal["EXIT_CELL"]
     cell: StreamCell
+
+
+def encode_stream_cell_payload(payload: bytes, *, padded_len: int = CELL_PAYLOAD_BYTES) -> tuple[str, str]:
+    if len(payload) > padded_len:
+        raise ValueError(f"payload too large: {len(payload)} > {padded_len}")
+    payload_b64 = b64e(payload)
+    padding = b"\x00" * (padded_len - len(payload))
+    return payload_b64, b64e(padding)
+
+
+def decode_stream_cell_payload(payload_b64: str, is_padding: bool = False) -> bytes:
+    if is_padding:
+        return b""
+    return b64d(payload_b64)
 
 
 @dataclass(frozen=True)
@@ -210,11 +230,32 @@ def parse_stream_cell(obj: Any) -> StreamCell:
     payload = src.get("payload", "")
     if not isinstance(payload, str):
         raise ValueError("missing or invalid field: payload")
+    padded_len = src.get("padded_len", CELL_PAYLOAD_BYTES)
+    if not isinstance(padded_len, int) or padded_len <= 0:
+        raise ValueError("missing or invalid field: padded_len")
+    payload_b64 = src.get("payload_b64")
+    if payload_b64 is None:
+        payload_b64 = b64e(payload.encode("utf-8"))
+    if not isinstance(payload_b64, str):
+        raise ValueError("missing or invalid field: payload_b64")
+    is_padding = src.get("is_padding", False)
+    if not isinstance(is_padding, bool):
+        raise ValueError("missing or invalid field: is_padding")
+    decoded = b64d(payload_b64)
+    if len(decoded) > padded_len:
+        raise ValueError("payload exceeds padded_len")
+    if padded_len != CELL_PAYLOAD_BYTES:
+        raise ValueError("unsupported padded_len")
+    if payload == "" and not is_padding:
+        payload = decoded.decode("utf-8", errors="replace")
     return StreamCell(
         stream_id=_req_int(src, "stream_id"),
         seq=_req_int(src, "seq"),
         cell_type=cell_type,
         payload=payload,
+        padded_len=padded_len,
+        payload_b64=payload_b64,
+        is_padding=is_padding,
     )
 
 
