@@ -180,6 +180,7 @@ def _build_parser() -> argparse.ArgumentParser:
     circuit_build.add_argument("--exit-weight-multiplier", type=float, default=1.0, help="Exit role effective-weight multiplier")
     circuit_build.add_argument("--min-reliability-cutoff", type=float, default=0.0, help="Minimum relay reliability score to receive non-zero effective weight")
     circuit_build.add_argument("--selection-seed", type=int, default=None, help="Optional deterministic seed for policy-based relay selection")
+    circuit_build.add_argument("--guard-state", default=".latnet-guards.json", help="Persistent guard state JSON path")
     circuit_build.add_argument("--trust-config", default=None, help="Trust config JSON file path")
     circuit_build.add_argument("--trusted-authority", action="append", default=[], help="Trusted authority as authority_id=public_key")
     circuit_build.add_argument("--min-signers", type=int, default=None, help="Threshold min_signers policy override")
@@ -281,6 +282,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Include rollback hints in output",
     )
 
+
+    admin = subparsers.add_parser("admin", help="Administrative operations")
+    admin_sub = admin.add_subparsers(dest="admin_cmd", required=True)
+
+    admin_guard = admin_sub.add_parser("guard-state", help="View or reset guard state")
+    admin_guard.add_argument("operation", choices=["view", "reset"])
+    admin_guard.add_argument("--guard-state", default=".latnet-guards.json", help="Persistent guard state JSON path")
+
     return parser
 
 
@@ -335,6 +344,7 @@ def main(argv: list[str] | None = None) -> int:
                     "exit_weight_multiplier": args.exit_weight_multiplier,
                     "min_reliability_cutoff": args.min_reliability_cutoff,
                 },
+                "guard_state_path": args.guard_state,
             }
             selected_relays = select_path(candidate_relays, policy=policy, state=selection_state)
             circuit = build_circuit(selected_relays, circuit_id=args.circuit_id)
@@ -378,6 +388,22 @@ def main(argv: list[str] | None = None) -> int:
         reply = end_stream(circuit, stream_id=args.stream_id, payload=args.payload)
         _save_session(args.session, circuit)
         _print_json(reply)
+        return 0
+
+    if args.top_cmd == "admin" and args.admin_cmd == "guard-state":
+        from .selection.policy import _guard_state_defaults
+
+        guard_file = Path(args.guard_state)
+        if args.operation == "reset":
+            data = _guard_state_defaults(int(time.time()))
+            atomic_write_json(str(guard_file), data)
+            _print_json({"ok": True, "operation": "reset", "guard_state": str(guard_file)})
+            return 0
+
+        if guard_file.exists():
+            _print_json(load_json(str(guard_file)))
+        else:
+            _print_json(_guard_state_defaults(int(time.time())))
         return 0
 
     if args.top_cmd == "hs" and args.hs_cmd == "fetch":

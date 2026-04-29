@@ -367,3 +367,18 @@ def test_cli_circuit_build_from_verified_relays_with_ordered_names(tmp_path, lat
     )
 
     assert rc == 0
+
+def test_cli_admin_guard_state_view_and_reset(tmp_path, latnet_modules, capsys):
+    cli = latnet_modules["cli"]
+    state_path = tmp_path / "guards.json"
+
+    rc_reset = cli.main(["admin", "guard-state", "reset", "--guard-state", str(state_path)])
+    assert rc_reset == 0
+    reset_out = json.loads(capsys.readouterr().out)
+    assert reset_out["ok"] is True
+
+    rc_view = cli.main(["admin", "guard-state", "view", "--guard-state", str(state_path)])
+    assert rc_view == 0
+    view_out = json.loads(capsys.readouterr().out)
+    assert "guards" in view_out
+    assert "policy" in view_out
