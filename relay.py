@@ -11,6 +11,7 @@ import oqs
 
 from .constants import CELL_PAYLOAD_BYTES, DEFAULT_TIMEOUT, KEMALG
 from .crypto import decrypt_layer, derive_hop_keys, encrypt_layer
+from .exit_connector import DemoOutboundConnector, OutboundConnector, TcpOutboundConnector
 from .models.protocol import encode_stream_cell_payload, parse_build_envelope, parse_cell_envelope, parse_destroy_envelope, parse_exit_cell_layer, parse_layer
 from .util import atomic_write_json, b64d, b64e, load_json
 from .wire import recv_msg, send_msg
@@ -42,6 +43,10 @@ class RelayServer:
         circuit_ttl_seconds: float = 900.0,
         circuit_idle_seconds: float = 300.0,
         stream_idle_seconds: float = 120.0,
+        outbound_connector: OutboundConnector | None = None,
+        enable_real_egress: bool = False,
+        outbound_connect_timeout: float = DEFAULT_TIMEOUT,
+        outbound_recv_timeout: float = DEFAULT_TIMEOUT,
     ):
         self.relay_doc = relay_doc
         self.circuits: dict[str, dict[str, Any]] = {}
@@ -55,6 +60,11 @@ class RelayServer:
         self.pending_introductions: dict[str, dict[str, Any]] = {}
         self.pending_rendezvous: dict[str, dict[str, Any]] = {}
         self.rendezvous_links: dict[str, dict[str, Any]] = {}
+        self.outbound_connector = outbound_connector or (
+            TcpOutboundConnector(connect_timeout=outbound_connect_timeout, recv_timeout=outbound_recv_timeout)
+            if enable_real_egress
+            else DemoOutboundConnector()
+        )
 
     @staticmethod
     def _touch_state(state: dict[str, Any], now: float | None = None) -> None:
@@ -159,6 +169,23 @@ class RelayServer:
         }
 
     def handle_exit_cell(self, circuit_id: str, state: dict[str, Any], cell: dict[str, Any]) -> dict[str, Any]:
+        def _parse_target_metadata(raw_target: str) -> dict[str, Any]:
+            text = str(raw_target or "").strip()
+            if not text:
+                raise ValueError("missing target")
+            if ":" not in text:
+                raise ValueError("target must be host:port")
+            host, port_s = text.rsplit(":", 1)
+            if not host:
+                raise ValueError("target host is empty")
+            try:
+                port = int(port_s)
+            except ValueError as exc:
+                raise ValueError("target port must be an integer") from exc
+            if port < 1 or port > 65535:
+                raise ValueError("target port out of range")
+            return {"host": host, "port": port}
+
         parsed_cell = parse_exit_cell_layer({"cmd": "EXIT_CELL", "cell": cell}).cell
         stream_id = parsed_cell.stream_id
         seq = parsed_cell.seq
@@ -207,23 +234,41 @@ class RelayServer:
                     "payload": f"invalid initial seq {seq} for stream {stream_id}; expected 1",
                 }
             else:
-                stream_state = {
-                    "stream_id": stream_id,
-                    "open": True,
-                    "opened_at": time.time(),
-                    "last_activity_at": time.time(),
-                    "last_seq": 0,
-                    "next_seq": 1,
-                    "seen_window": [],
-                }
-                self._advance_seq_window(stream_state, seq)
-                self.update_stream_state(circuit_id, stream_id, stream_state)
-                reply_cell = {
-                    "stream_id": stream_id,
-                    "seq": seq,
-                    "cell_type": "CONNECTED",
-                    "payload": f"stream {stream_id} opened at exit {self.relay_doc['name']}",
-                }
+                try:
+                    target = _parse_target_metadata(payload)
+                    target["stream_id"] = stream_id
+                    session = self.outbound_connector.connect(target)
+                    now = time.time()
+                    stream_state = {
+                        "stream_id": stream_id,
+                        "open": True,
+                        "opened_at": now,
+                        "last_activity_at": now,
+                        "last_seq": 0,
+                        "next_seq": 1,
+                        "seen_window": [],
+                        "target": f"{target['host']}:{target['port']}",
+                        "target_host": target["host"],
+                        "target_port": target["port"],
+                        "connector_session_handle": repr(session.handle),
+                        "connector_connected_at": session.created_at,
+                        "connector_last_activity_at": session.last_activity_at,
+                    }
+                    self._advance_seq_window(stream_state, seq)
+                    self.update_stream_state(circuit_id, stream_id, stream_state)
+                    reply_cell = {
+                        "stream_id": stream_id,
+                        "seq": seq,
+                        "cell_type": "CONNECTED",
+                        "payload": f"stream {stream_id} opened to {target['host']}:{target['port']} at exit {self.relay_doc['name']}",
+                    }
+                except Exception as exc:
+                    reply_cell = {
+                        "stream_id": stream_id,
+                        "seq": seq,
+                        "cell_type": "ERROR",
+                        "payload": f"connect failed: {exc}",
+                    }
         elif cell_type == "DATA":
             if not stream_state:
                 reply_cell = {
@@ -249,15 +294,28 @@ class RelayServer:
                         "payload": f"stream {stream_id} is not open",
                     }
                 else:
-                    self._advance_seq_window(stream_state, seq)
-                    stream_state["last_activity_at"] = time.time()
-                    self.update_stream_state(circuit_id, stream_id, stream_state)
-                    reply_cell = {
-                        "stream_id": stream_id,
-                        "seq": seq,
-                        "cell_type": "DATA",
-                        "payload": f"echo[{stream_id}] {payload}",
-                    }
+                    try:
+                        self.outbound_connector.send(stream_id, str(payload).encode("utf-8"))
+                        recv_bytes = self.outbound_connector.recv(stream_id)
+                        recv_payload = recv_bytes.decode("utf-8", errors="replace")
+                        self._advance_seq_window(stream_state, seq)
+                        now = time.time()
+                        stream_state["last_activity_at"] = now
+                        stream_state["connector_last_activity_at"] = now
+                        self.update_stream_state(circuit_id, stream_id, stream_state)
+                        reply_cell = {
+                            "stream_id": stream_id,
+                            "seq": seq,
+                            "cell_type": "DATA",
+                            "payload": recv_payload,
+                        }
+                    except Exception as exc:
+                        reply_cell = {
+                            "stream_id": stream_id,
+                            "seq": seq,
+                            "cell_type": "ERROR",
+                            "payload": f"data relay failed: {exc}",
+                        }
         elif cell_type == "END":
             if not stream_state:
                 reply_cell = {
@@ -287,6 +345,8 @@ class RelayServer:
                     stream_state["open"] = False
                     stream_state["closed_at"] = time.time()
                     stream_state["last_activity_at"] = time.time()
+                    stream_state["connector_last_activity_at"] = stream_state["last_activity_at"]
+                    self.outbound_connector.close(stream_id)
                     self.update_stream_state(circuit_id, stream_id, stream_state)
                     reply_cell = {
                         "stream_id": stream_id,
@@ -379,6 +439,10 @@ class RelayServer:
                     if (ts - stream_last) >= self.stream_idle_seconds:
                         stale_streams.append(sid)
                 for sid in stale_streams:
+                    try:
+                        self.outbound_connector.close(int(sid))
+                    except Exception:
+                        pass
                     streams.pop(sid, None)
 
                 created = float(state.get("created_at", ts))
