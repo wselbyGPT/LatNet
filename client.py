@@ -10,11 +10,12 @@ from typing import Any
 import oqs
 
 from .authority import verify_network_status
-from .constants import DEFAULT_TIMEOUT
+from .constants import CELL_PAYLOAD_BYTES, DEFAULT_TIMEOUT
 from .crypto import decrypt_layer, derive_hop_keys, encrypt_layer
 from .models.hidden_service import parse_lettuce_name
 from .models.hidden_service_descriptor import verify_hidden_service_descriptor_v2
 from .models.protocol import (
+    encode_stream_cell_payload,
     parse_publish_hidden_service_descriptor_request,
     parse_publish_hidden_service_descriptor_response,
 )
@@ -464,7 +465,18 @@ def build_circuit(path_of_relays: list[dict[str, Any]], circuit_id: str | None =
 
 
 def _wrap_forward_cell(circuit: CircuitSession, cell: dict[str, Any]) -> dict[str, str]:
-    inner = encrypt_layer(circuit.hops[-1].forward_key, {"cmd": "EXIT_CELL", "cell": cell})
+    payload_text = cell.get("payload", "")
+    if not isinstance(payload_text, str):
+        raise ValueError("cell payload must be a string")
+    payload_raw = payload_text.encode("utf-8")
+    if len(payload_raw) > CELL_PAYLOAD_BYTES:
+        raise ValueError(f"stream payload exceeds cell budget ({len(payload_raw)}>{CELL_PAYLOAD_BYTES})")
+    payload_b64, _padding_b64 = encode_stream_cell_payload(payload_raw, padded_len=CELL_PAYLOAD_BYTES)
+    wrapped_cell = dict(cell)
+    wrapped_cell["padded_len"] = CELL_PAYLOAD_BYTES
+    wrapped_cell["payload_b64"] = payload_b64
+    wrapped_cell["is_padding"] = False
+    inner = encrypt_layer(circuit.hops[-1].forward_key, {"cmd": "EXIT_CELL", "cell": wrapped_cell})
     for hop in reversed(circuit.hops[:-1]):
         inner = encrypt_layer(hop.forward_key, {"cmd": "FORWARD_CELL", "inner": inner})
     return inner
@@ -488,6 +500,13 @@ def _unwrap_reply_cell(circuit: CircuitSession, response: dict[str, Any]) -> dic
     cell = layer.get("cell")
     if not isinstance(cell, dict):
         raise ValueError("reply cell missing")
+    payload_b64 = cell.get("payload_b64")
+    if isinstance(payload_b64, str) and not cell.get("is_padding", False):
+        try:
+            payload_raw = b64d(payload_b64)
+            cell["payload"] = payload_raw.decode("utf-8", errors="replace")
+        except Exception as exc:
+            raise ValueError("invalid reply payload_b64") from exc
     return cell
 
 
