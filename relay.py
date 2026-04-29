@@ -739,6 +739,21 @@ class RelayServer:
         print(f"[{self.relay_doc['name']}] circuit {circuit_id} destroyed")
         return {"ok": True, "status": "destroyed"}
 
+    def handle_cell_batch(self, msg: dict[str, Any]) -> dict[str, Any]:
+        circuit_id = msg.get("circuit_id")
+        layers = msg.get("layers")
+        if not isinstance(circuit_id, str) or not circuit_id:
+            return {"ok": False, "error": "missing or invalid field: circuit_id"}
+        if not isinstance(layers, list) or not layers:
+            return {"ok": False, "error": "missing or invalid field: layers"}
+        replies: list[dict[str, Any]] = []
+        for layer in layers:
+            reply = self.handle_cell({"type": "CELL", "circuit_id": circuit_id, "layer": layer})
+            replies.append(reply)
+            if not reply.get("ok"):
+                break
+        return {"ok": all(item.get("ok") for item in replies), "replies": replies}
+
     def handle_conn(self, conn: socket.socket) -> None:
         try:
             msg = recv_msg(conn)
@@ -748,6 +763,8 @@ class RelayServer:
                 response = self.handle_build(msg)
             elif msg_type == "CELL":
                 response = self.handle_cell(msg)
+            elif msg_type == "CELL_BATCH":
+                response = self.handle_cell_batch(msg)
             elif msg_type == "DESTROY":
                 response = self.handle_destroy(msg)
             else:
