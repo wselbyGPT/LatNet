@@ -4,6 +4,8 @@ import time
 import uuid
 import random
 import threading
+import hashlib
+import hmac
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -13,7 +15,7 @@ from .constants import DEFAULT_TIMEOUT
 from .crypto import decrypt_layer, derive_hop_keys, encrypt_layer
 from .hidden_service_keys import load_service_master
 from .models.hidden_service_descriptor import verify_hidden_service_descriptor_v2
-from .util import b64d, b64e, load_json
+from .util import b64d, b64e, canonical_bytes, load_json
 from .wire import recv_msg, send_msg
 
 
@@ -210,6 +212,35 @@ class ServiceKeepaliveScheduler:
             except Exception:
                 continue
 
+
+
+def mint_intro_auth_token(
+    rendezvous_cookie: str,
+    *,
+    relay_doc: dict[str, Any],
+    service_name: str,
+    side: str = "client",
+    ttl_seconds: int = 30,
+    now: int | None = None,
+) -> dict[str, Any]:
+    issued_at = int(time.time()) if now is None else int(now)
+    exp = issued_at + max(1, int(ttl_seconds))
+    payload = {
+        "jti": str(uuid.uuid4()),
+        "iat": issued_at,
+        "exp": exp,
+        "scope": {
+            "service_name": service_name,
+            "relay_name": relay_doc.get("name"),
+            "rendezvous_cookie": rendezvous_cookie,
+            "side": side,
+        },
+    }
+    key = b64d(relay_doc["secret_key"])
+    sig = hmac.new(key, canonical_bytes(payload), hashlib.sha256).digest()
+    return {"payload": payload, "sig": b64e(sig)}
+
+
 def load_service_material(service_master_path: str, descriptor_path: str, *, now: int | None = None) -> dict[str, Any]:
     service_master = load_service_master(service_master_path)
     descriptor_doc = load_json(descriptor_path)
@@ -393,6 +424,7 @@ def establish_service_rendezvous(
                     "cmd": "RENDEZVOUS_ESTABLISH",
                     "rendezvous_cookie": rendezvous_cookie,
                     "side": "service",
+                    "auth_token": mint_intro_auth_token(rendezvous_cookie, relay_doc=relay_doc, service_name="service", side="service"),
                 },
             )
             if reply.get("cmd") != "RENDEZVOUS_STATE":

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import time
+import hashlib
+import hmac
 
 import pytest
 
@@ -11,6 +13,23 @@ def _enc(mod, key: bytes, payload: dict):
 
 def _dec(mod, key: bytes, payload: dict):
     return mod.decrypt_layer(key, payload)
+
+
+def _token(util, relay_doc: dict, cookie: str, side: str, *, exp_offset: int = 30, jti: str = "jti-1") -> dict:
+    now = int(time.time())
+    payload = {
+        "jti": jti,
+        "iat": now,
+        "exp": now + exp_offset,
+        "scope": {
+            "service_name": "svc",
+            "relay_name": relay_doc["name"],
+            "rendezvous_cookie": cookie,
+            "side": side,
+        },
+    }
+    sig = hmac.new(util.b64d(relay_doc["secret_key"]), util.canonical_bytes(payload), hashlib.sha256).digest()
+    return {"payload": payload, "sig": util.b64e(sig)}
 
 
 def test_intro_messages_validate_and_poll_roundtrip(latnet_modules, relay_doc_fixture, mock_key_material):
@@ -39,7 +58,7 @@ def test_intro_messages_validate_and_poll_roundtrip(latnet_modules, relay_doc_fi
             "layer": _enc(
                 crypto,
                 mock_key_material["forward"],
-                {"cmd": "INTRODUCE", "rendezvous_cookie": "cookie-1", "introduction": {"k": "v"}},
+                {"cmd": "INTRODUCE", "rendezvous_cookie": "cookie-1", "introduction": {"k": "v"}, "auth_token": _token(latnet_modules["util"], relay_doc_fixture, "cookie-1", "client", jti="m1")},
             ),
         }
     )
@@ -85,7 +104,7 @@ def test_rendezvous_messages_validate_cookie_side_and_join_state(latnet_modules,
             "layer": _enc(
                 crypto,
                 mock_key_material["forward"],
-                {"cmd": "RENDEZVOUS_ESTABLISH", "rendezvous_cookie": "cookie-2", "side": "client"},
+                {"cmd": "RENDEZVOUS_ESTABLISH", "rendezvous_cookie": "cookie-2", "side": "client", "auth_token": _token(latnet_modules["util"], relay_doc_fixture, "cookie-2", "client", jti="m2")},
             ),
         }
     )
@@ -99,7 +118,7 @@ def test_rendezvous_messages_validate_cookie_side_and_join_state(latnet_modules,
             "layer": _enc(
                 crypto,
                 mock_key_material["forward"],
-                {"cmd": "RENDEZVOUS_ESTABLISH", "rendezvous_cookie": "cookie-2", "side": "service"},
+                {"cmd": "RENDEZVOUS_ESTABLISH", "rendezvous_cookie": "cookie-2", "side": "service", "auth_token": _token(latnet_modules["util"], relay_doc_fixture, "cookie-2", "service", jti="m3")},
             ),
         }
     )
@@ -241,3 +260,19 @@ def test_network_status_protocol_models_validate_fields(latnet_modules):
         protocol.parse_get_network_status_response(
             {"ok": False, "protocol_version": 1, "error_class": "network_status_unavailable", "error": "not found"}
         )
+
+def test_intro_token_expired_and_replay_rejected(latnet_modules, relay_doc_fixture, mock_key_material):
+    relay_mod = latnet_modules["relay"]
+    crypto = latnet_modules["crypto"]
+    util = latnet_modules["util"]
+    server = relay_mod.RelayServer(relay_doc_fixture)
+    server.set_circuit_state("intro-x", {"role":"intro","forward_key":mock_key_material["forward_b64"],"reverse_key":mock_key_material["reverse_b64"],"streams":{},"lifecycle_state":"ready","created_at":time.time(),"last_activity_at":time.time()})
+    expired = _token(util, relay_doc_fixture, "cookie-exp", "client", exp_offset=-1, jti="exp")
+    bad = server.handle_cell({"type":"CELL","circuit_id":"intro-x","layer":_enc(crypto,mock_key_material["forward"],{"cmd":"INTRODUCE","rendezvous_cookie":"cookie-exp","introduction":{},"auth_token":expired})})
+    assert bad["ok"] is False and bad.get("error_class") == "token_expired"
+
+    tok = _token(util, relay_doc_fixture, "cookie-r", "client", jti="replay")
+    first = server.handle_cell({"type":"CELL","circuit_id":"intro-x","layer":_enc(crypto,mock_key_material["forward"],{"cmd":"INTRODUCE","rendezvous_cookie":"cookie-r","introduction":{},"auth_token":tok})})
+    second = server.handle_cell({"type":"CELL","circuit_id":"intro-x","layer":_enc(crypto,mock_key_material["forward"],{"cmd":"INTRODUCE","rendezvous_cookie":"cookie-r","introduction":{},"auth_token":tok})})
+    assert first["ok"] is True
+    assert second["ok"] is False and second.get("error_class") == "token_replay"
