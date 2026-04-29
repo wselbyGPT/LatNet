@@ -189,3 +189,42 @@ def test_fetch_hidden_service_descriptor_surfaces_no_descriptor_error(monkeypatc
         raise AssertionError("expected ValueError")
     except ValueError as exc:
         assert str(exc) == client.NO_DESCRIPTOR_ERROR
+
+
+def test_client_flushes_cell_batch_and_maps_replies(monkeypatch, latnet_modules):
+    client = latnet_modules["client"]
+    circuit = client.CircuitSession(circuit_id="cid-batch", guard_host="127.0.0.1", guard_port=9001, hops=[])
+
+    monkeypatch.setattr(client, "_wrap_forward_cell", lambda _c, cell: {"wrapped": cell})
+
+    def fake_unwrap(_c, response):
+        wrapped = response["reply_layer"]["wrapped"]
+        return {"stream_id": wrapped["stream_id"], "seq": wrapped["seq"], "cell_type": "DATA", "payload": "ok"}
+
+    monkeypatch.setattr(client, "_unwrap_reply_cell", fake_unwrap)
+
+    def fake_send(_host, _port, msg):
+        if msg["type"] != "CELL_BATCH":
+            raise AssertionError("expected CELL_BATCH")
+        return {
+            "ok": True,
+            "replies": [
+                {"ok": True, "reply_layer": {"wrapped": layer["wrapped"]}}
+                for layer in msg["layers"]
+            ],
+        }
+
+    monkeypatch.setattr(client, "_send_guard_message", fake_send)
+
+    circuit.cell_batcher = client.CircuitCellBatcher(flush_window_ms=9999, max_batch_size=8)
+    reply_cells = client._send_batched_cells(
+        circuit,
+        include_current={"stream_id": 1, "seq": 1, "cell_type": "DATA", "payload": "a"},
+    )
+    assert reply_cells == []
+    reply_cells = client._send_batched_cells(
+        circuit,
+        include_current={"stream_id": 1, "seq": 2, "cell_type": "DATA", "payload": "b"},
+        force_flush=True,
+    )
+    assert [cell["seq"] for cell in reply_cells] == [1, 2]

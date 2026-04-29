@@ -63,6 +63,39 @@ class CircuitSession:
     guard_port: int
     hops: list[HopSession]
     stream_next_seq: dict[int, int] = field(default_factory=dict)
+    cell_batcher: "CircuitCellBatcher | None" = None
+
+
+@dataclass
+class _QueuedCell:
+    cell: dict[str, Any]
+    enqueued_at: float
+
+
+@dataclass
+class CircuitCellBatcher:
+    flush_window_ms: int = 30
+    max_batch_size: int = 8
+    queue: list[_QueuedCell] = field(default_factory=list)
+
+    def enqueue(self, cell: dict[str, Any], *, now: float | None = None) -> None:
+        self.queue.append(_QueuedCell(cell=dict(cell), enqueued_at=time.time() if now is None else now))
+
+    def should_flush(self, *, now: float | None = None, force: bool = False) -> bool:
+        if force:
+            return bool(self.queue)
+        if not self.queue:
+            return False
+        if len(self.queue) >= self.max_batch_size:
+            return True
+        ts = time.time() if now is None else now
+        age_ms = (ts - self.queue[0].enqueued_at) * 1000.0
+        return age_ms >= self.flush_window_ms
+
+    def pop_batch(self) -> list[dict[str, Any]]:
+        batch = [entry.cell for entry in self.queue[: self.max_batch_size]]
+        self.queue = self.queue[len(batch) :]
+        return batch
 
 
 @dataclass(frozen=True)
@@ -510,15 +543,58 @@ def _unwrap_reply_cell(circuit: CircuitSession, response: dict[str, Any]) -> dic
     return cell
 
 
+def _unwrap_reply_cells(circuit: CircuitSession, response: dict[str, Any]) -> list[dict[str, Any]]:
+    if "replies" not in response:
+        return [_unwrap_reply_cell(circuit, response)]
+    replies = response.get("replies")
+    if not isinstance(replies, list):
+        raise ValueError("CELL_BATCH response replies must be a list")
+    return [_unwrap_reply_cell(circuit, item) for item in replies]
+
+
+def _send_batched_cells(
+    circuit: CircuitSession,
+    *,
+    force_flush: bool = False,
+    include_current: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    batcher = circuit.cell_batcher or CircuitCellBatcher()
+    circuit.cell_batcher = batcher
+    if include_current is not None:
+        batcher.enqueue(include_current)
+    if not batcher.should_flush(force=force_flush):
+        return []
+
+    replies: list[dict[str, Any]] = []
+    while batcher.queue:
+        cells = batcher.pop_batch()
+        if len(cells) == 1:
+            response = _send_guard_message(
+                circuit.guard_host,
+                circuit.guard_port,
+                {"type": "CELL", "circuit_id": circuit.circuit_id, "layer": _wrap_forward_cell(circuit, cells[0])},
+            )
+        else:
+            response = _send_guard_message(
+                circuit.guard_host,
+                circuit.guard_port,
+                {
+                    "type": "CELL_BATCH",
+                    "circuit_id": circuit.circuit_id,
+                    "layers": [_wrap_forward_cell(circuit, cell) for cell in cells],
+                },
+            )
+        replies.extend(_unwrap_reply_cells(circuit, response))
+    return replies
+
+
 
 def open_stream(circuit: CircuitSession, stream_id: int, target: str = "") -> dict[str, Any]:
     cell = {"stream_id": stream_id, "seq": 1, "cell_type": "BEGIN", "payload": target}
-    response = _send_guard_message(
-        circuit.guard_host,
-        circuit.guard_port,
-        {"type": "CELL", "circuit_id": circuit.circuit_id, "layer": _wrap_forward_cell(circuit, cell)},
-    )
-    reply_cell = _unwrap_reply_cell(circuit, response)
+    reply_cells = _send_batched_cells(circuit, include_current=cell, force_flush=True)
+    if not reply_cells:
+        raise ValueError("missing BEGIN reply")
+    reply_cell = reply_cells[-1]
     if reply_cell.get("cell_type") == "CONNECTED":
         circuit.stream_next_seq[stream_id] = 2
     return reply_cell
@@ -530,12 +606,10 @@ def send_stream_data(circuit: CircuitSession, stream_id: int, payload: str) -> d
     if seq is None:
         raise ValueError(f"stream {stream_id} is not open")
     cell = {"stream_id": stream_id, "seq": seq, "cell_type": "DATA", "payload": payload}
-    response = _send_guard_message(
-        circuit.guard_host,
-        circuit.guard_port,
-        {"type": "CELL", "circuit_id": circuit.circuit_id, "layer": _wrap_forward_cell(circuit, cell)},
-    )
-    reply_cell = _unwrap_reply_cell(circuit, response)
+    reply_cells = _send_batched_cells(circuit, include_current=cell, force_flush=True)
+    if not reply_cells:
+        raise ValueError("missing DATA reply")
+    reply_cell = reply_cells[-1]
     if reply_cell.get("cell_type") != "ERROR":
         circuit.stream_next_seq[stream_id] = seq + 1
     return reply_cell
@@ -547,12 +621,10 @@ def end_stream(circuit: CircuitSession, stream_id: int, payload: str = "") -> di
     if seq is None:
         raise ValueError(f"stream {stream_id} is not open")
     cell = {"stream_id": stream_id, "seq": seq, "cell_type": "END", "payload": payload}
-    response = _send_guard_message(
-        circuit.guard_host,
-        circuit.guard_port,
-        {"type": "CELL", "circuit_id": circuit.circuit_id, "layer": _wrap_forward_cell(circuit, cell)},
-    )
-    reply_cell = _unwrap_reply_cell(circuit, response)
+    reply_cells = _send_batched_cells(circuit, include_current=cell, force_flush=True)
+    if not reply_cells:
+        raise ValueError("missing END reply")
+    reply_cell = reply_cells[-1]
     if reply_cell.get("cell_type") in {"ENDED", "ERROR"}:
         circuit.stream_next_seq.pop(stream_id, None)
     return reply_cell
@@ -560,6 +632,7 @@ def end_stream(circuit: CircuitSession, stream_id: int, payload: str = "") -> di
 
 
 def destroy_circuit(circuit: CircuitSession) -> dict[str, Any]:
+    _send_batched_cells(circuit, force_flush=True)
     response = _send_guard_message(
         circuit.guard_host,
         circuit.guard_port,
