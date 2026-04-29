@@ -250,3 +250,18 @@ Tuneable policy fields:
 Operator commands:
 - `latnet admin guard-state view`
 - `latnet admin guard-state reset`
+
+## Relay stream flow-control thresholds
+
+Recommended initial thresholds per stream (tune by memory budget and latency SLO):
+
+- `queue_high_water_bytes`: 64 KiB
+- `queue_low_water_bytes`: 16 KiB (25% of high-water)
+- `connector_io_timeout_seconds`: 250ms service slice
+
+Operator guidance:
+
+- Alert warning if `throttled_events` is sustained (>1% of stream `DATA` attempts over 10m).
+- Alert critical if `blocked_since` remains non-null for >30s on active streams.
+- Watch `write_stalls`/`read_stalls`; sustained growth indicates slow or failing egress paths.
+- Track `service_time_ms_total / service_events` and `queue_depth_max`; rising values indicate per-circuit head-of-line risk.
