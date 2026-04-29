@@ -65,3 +65,29 @@ Policy parameters are stored in the guard state under `policy`: `max_pinned_guar
 Admin operations:
 - `latnet admin guard-state view [--guard-state PATH]`
 - `latnet admin guard-state reset [--guard-state PATH]`
+
+
+## WSL deploy dependency note (OQS bindings)
+
+`deploy_wsl.sh` expects the liboqs-backed Python module that exposes `oqs.KeyEncapsulation`.
+If deploy fails with `AttributeError: module 'oqs' has no attribute 'KeyEncapsulation'`, your venv usually has the wrong package (or no OQS bindings installed).
+
+Try this first inside your active venv:
+
+```bash
+pip uninstall -y oqs
+pip install liboqs-python cryptography
+```
+
+If your environment still cannot resolve `liboqs-python`, install from the official source repo (and keep `cryptography` installed):
+
+```bash
+git clone --depth=1 https://github.com/open-quantum-safe/liboqs-python
+pip install ./liboqs-python
+```
+
+Then rerun:
+
+```bash
+./deploy_wsl.sh
+```

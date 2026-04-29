@@ -18,6 +18,26 @@ import pathlib
 import sys
 import types
 
+try:
+    import oqs
+except Exception as exc:  # pragma: no cover - deploy-time guard
+    raise SystemExit(
+        "Missing OQS Python bindings. Install the liboqs-backed package (for example, 'pip install liboqs-python') and retry."
+    ) from exc
+
+if not hasattr(oqs, 'KeyEncapsulation'):
+    raise SystemExit(
+        "Detected an incompatible 'oqs' module: KeyEncapsulation is missing. \
+Uninstall the wrong package (often installed as 'oqs') and install liboqs bindings instead (for example, 'pip install liboqs-python')."
+    )
+
+try:
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey  # noqa: F401
+except Exception as exc:  # pragma: no cover - deploy-time guard
+    raise SystemExit(
+        "Missing Python dependency 'cryptography'. Install it in your venv (for example, 'pip install cryptography') and retry."
+    ) from exc
+
 root = pathlib.Path('.').resolve()
 pkg = types.ModuleType('latnet')
 pkg.__path__ = [str(root)]
