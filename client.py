@@ -5,7 +5,7 @@ import uuid
 import os
 import json
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 import oqs
 
@@ -64,6 +64,14 @@ class CircuitSession:
     hops: list[HopSession]
     stream_next_seq: dict[int, int] = field(default_factory=dict)
     cell_batcher: "CircuitCellBatcher | None" = None
+
+
+@dataclass(frozen=True)
+class PaddingPolicyConfig:
+    mode: Literal["disabled", "opportunistic", "constant-rate"] = "disabled"
+    min_interval_s: float = 0.25
+    max_interval_s: float = 2.0
+    burst_limit: int = 4
 
 
 @dataclass
@@ -504,15 +512,20 @@ def _wrap_forward_cell(circuit: CircuitSession, cell: dict[str, Any]) -> dict[st
     payload_raw = payload_text.encode("utf-8")
     if len(payload_raw) > CELL_PAYLOAD_BYTES:
         raise ValueError(f"stream payload exceeds cell budget ({len(payload_raw)}>{CELL_PAYLOAD_BYTES})")
-    payload_b64, _padding_b64 = encode_stream_cell_payload(payload_raw, padded_len=CELL_PAYLOAD_BYTES)
+    payload_b64, padding_b64 = encode_stream_cell_payload(payload_raw, padded_len=CELL_PAYLOAD_BYTES)
     wrapped_cell = dict(cell)
     wrapped_cell["padded_len"] = CELL_PAYLOAD_BYTES
     wrapped_cell["payload_b64"] = payload_b64
-    wrapped_cell["is_padding"] = False
+    wrapped_cell["padding_b64"] = padding_b64
+    wrapped_cell["is_padding"] = cell.get("cell_type") == "PADDING"
     inner = encrypt_layer(circuit.hops[-1].forward_key, {"cmd": "EXIT_CELL", "cell": wrapped_cell})
     for hop in reversed(circuit.hops[:-1]):
         inner = encrypt_layer(hop.forward_key, {"cmd": "FORWARD_CELL", "inner": inner})
     return inner
+
+
+def build_padding_cell(stream_id: int, seq: int = 0) -> dict[str, Any]:
+    return {"stream_id": stream_id, "seq": seq, "cell_type": "PADDING", "payload": ""}
 
 
 
@@ -684,4 +697,6 @@ __all__ = [
     "destroy_circuit",
     "demo_circuit_echo",
     "CircuitSession",
+    "PaddingPolicyConfig",
+    "build_padding_cell",
 ]

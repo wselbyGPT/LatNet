@@ -164,6 +164,28 @@ class RelayServer:
         seq = parsed_cell.seq
         cell_type = parsed_cell.cell_type
         payload = parsed_cell.payload
+        if cell_type == "PADDING":
+            reply_cell = {
+                "stream_id": stream_id,
+                "seq": seq,
+                "cell_type": "PADDING",
+                "payload": "",
+                "is_padding": True,
+            }
+            reply_payload_b64, reply_padding_b64 = encode_stream_cell_payload(b"", padded_len=CELL_PAYLOAD_BYTES)
+            reply_cell["padded_len"] = CELL_PAYLOAD_BYTES
+            reply_cell["payload_b64"] = reply_payload_b64
+            reply_cell["padding_b64"] = reply_padding_b64
+            return {
+                "ok": True,
+                "reply_layer": encrypt_layer(
+                    b64d(state["reverse_key"]),
+                    {
+                        "cmd": "REPLY_CELL",
+                        "cell": reply_cell,
+                    },
+                ),
+            }
 
         streams = state.setdefault("streams", {})
         sid = str(stream_id)
@@ -295,9 +317,10 @@ class RelayServer:
         reply_payload = str(reply_cell.get("payload", "")).encode("utf-8")
         if len(reply_payload) > CELL_PAYLOAD_BYTES:
             raise ValueError("reply payload exceeds cell budget")
-        reply_payload_b64, _pad_b64 = encode_stream_cell_payload(reply_payload, padded_len=CELL_PAYLOAD_BYTES)
+        reply_payload_b64, pad_b64 = encode_stream_cell_payload(reply_payload, padded_len=CELL_PAYLOAD_BYTES)
         reply_cell["padded_len"] = CELL_PAYLOAD_BYTES
         reply_cell["payload_b64"] = reply_payload_b64
+        reply_cell["padding_b64"] = pad_b64
         reply_cell["is_padding"] = False
 
         return {

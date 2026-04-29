@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 import oqs
 
@@ -39,6 +39,14 @@ class ReliabilityConfig:
 
 
 DEFAULT_RELIABILITY_CONFIG = ReliabilityConfig()
+
+
+@dataclass(frozen=True)
+class PaddingPolicyConfig:
+    mode: Literal["disabled", "opportunistic", "constant-rate"] = "disabled"
+    min_interval_s: float = 0.25
+    max_interval_s: float = 2.0
+    burst_limit: int = 4
 
 
 class HiddenServiceRuntimeError(Exception):

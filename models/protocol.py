@@ -19,7 +19,7 @@ LayerCmd = Literal[
     "RELAY_BACK",
     "REPLY_CELL",
 ]
-StreamCellType = Literal["BEGIN", "DATA", "END", "CONNECTED", "ENDED", "ERROR"]
+StreamCellType = Literal["BEGIN", "DATA", "END", "CONNECTED", "ENDED", "ERROR", "PADDING"]
 
 
 def _as_dict(obj: Any, *, context: str) -> dict[str, Any]:
@@ -225,7 +225,7 @@ def parse_destroy_envelope(obj: Any) -> DestroyEnvelope:
 def parse_stream_cell(obj: Any) -> StreamCell:
     src = _as_dict(obj, context="stream cell")
     cell_type = _req_str(src, "cell_type")
-    if cell_type not in {"BEGIN", "DATA", "END", "CONNECTED", "ENDED", "ERROR"}:
+    if cell_type not in {"BEGIN", "DATA", "END", "CONNECTED", "ENDED", "ERROR", "PADDING"}:
         raise ValueError("missing or invalid field: cell_type")
     payload = src.get("payload", "")
     if not isinstance(payload, str):
