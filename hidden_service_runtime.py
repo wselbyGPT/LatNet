@@ -41,6 +41,7 @@ class ReliabilityConfig:
 
 
 DEFAULT_RELIABILITY_CONFIG = ReliabilityConfig()
+_MIN_SELECTION_PROBABILITY = 0.05
 
 
 @dataclass(frozen=True)
@@ -486,9 +487,7 @@ def handle_intro_request_with_echo(
     if not isinstance(intro, dict):
         raise InvalidIntroPayloadError("missing or invalid field: introduction")
 
-    rendezvous_relay = intro.get("rendezvous_relay")
-    if not isinstance(rendezvous_relay, dict):
-        raise InvalidIntroPayloadError("missing or invalid field: rendezvous_relay")
+    rendezvous_relay = _choose_rendezvous_relay(intro)
 
     service_rdv_circuit, joined = establish_service_rendezvous(rendezvous_relay, cookie, config=config)
 
@@ -505,6 +504,46 @@ def handle_intro_request_with_echo(
         "echoed_payload": echoed,
         "service_circuit_id": service_rdv_circuit.circuit_id,
     }
+
+
+def _choose_rendezvous_relay(intro: dict[str, Any], *, now: int | None = None, rng_seed: int | None = None) -> dict[str, Any]:
+    direct = intro.get("rendezvous_relay")
+    if isinstance(direct, dict):
+        return direct
+    candidates = intro.get("rendezvous_relays")
+    if not isinstance(candidates, list) or not candidates:
+        raise InvalidIntroPayloadError("missing or invalid field: rendezvous_relay")
+    valid = [relay for relay in candidates if isinstance(relay, dict)]
+    if not valid:
+        raise InvalidIntroPayloadError("missing or invalid field: rendezvous_relay")
+    ts = int(time.time()) if now is None else int(now)
+    rng = random.Random(rng_seed)
+    scored = sorted(((_relay_health_score(relay, now=ts), relay) for relay in valid), key=lambda item: item[0], reverse=True)
+    top = scored[: min(3, len(scored))]
+    weights = [max(_MIN_SELECTION_PROBABILITY, score) for score, _ in top]
+    idx = rng.choices(range(len(top)), weights=weights, k=1)[0]
+    return top[idx][1]
+
+
+def _relay_health_score(relay: dict[str, Any], *, now: int) -> float:
+    if isinstance(relay.get("health_score"), (float, int)):
+        return max(_MIN_SELECTION_PROBABILITY, min(1.0, float(relay["health_score"])))
+    telemetry = relay.get("relay_health")
+    if not isinstance(telemetry, dict):
+        telemetry = {}
+    success_rate = float(telemetry.get("success_rate", 0.5))
+    timeout_rate = float(telemetry.get("timeout_rate", 0.0))
+    recent_latency_ms = float(telemetry.get("recent_latency_ms", 200.0))
+    fail_streak = float(telemetry.get("recent_failures", 0.0))
+    success_streak = float(telemetry.get("recent_successes", 0.0))
+    measured_at = telemetry.get("measured_at")
+    age_s = max(0.0, float(now - measured_at)) if isinstance(measured_at, int) else 0.0
+    latency_factor = 1.0 / (1.0 + (recent_latency_ms / 400.0))
+    freshness = 1.0 / (1.0 + age_s / 1800.0)
+    score = (0.55 * success_rate) + (0.25 * latency_factor) + (0.20 * (1.0 - timeout_rate))
+    score = score * freshness
+    score = max(0.0, score - min(0.7, fail_streak * 0.2) + min(0.25, success_streak * 0.05))
+    return max(_MIN_SELECTION_PROBABILITY, min(1.0, score))
 
 
 def error_to_dict(error: Exception) -> dict[str, Any]:

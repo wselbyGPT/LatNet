@@ -29,6 +29,8 @@ class HSIntroductionPointV2:
     intro_auth_pub: str
     intro_key_id: str
     expires_at: int
+    health_score: float | None = None
+    telemetry_measured_at: int | None = None
 
 
 @dataclass(frozen=True)
@@ -70,6 +72,11 @@ def _req_int(src: dict[str, Any], field: str) -> int:
 def _parse_intro_point(obj: Any) -> HSIntroductionPointV2:
     src = _as_dict(obj, context="introduction point")
     relay_addr = _as_dict(src.get("relay_addr"), context="relay_addr")
+    health_score_raw = src.get("health_score")
+    health_score = float(health_score_raw) if isinstance(health_score_raw, (int, float)) else None
+    telemetry_measured_at = src.get("telemetry_measured_at")
+    if telemetry_measured_at is not None and not isinstance(telemetry_measured_at, int):
+        raise ValueError("missing or invalid field: telemetry_measured_at")
     return HSIntroductionPointV2(
         relay_name=_req_str(src, "relay_name"),
         relay_host=_req_str(relay_addr, "host"),
@@ -77,6 +84,8 @@ def _parse_intro_point(obj: Any) -> HSIntroductionPointV2:
         intro_auth_pub=_req_str(src, "intro_auth_pub"),
         intro_key_id=_req_str(src, "intro_key_id"),
         expires_at=_req_int(src, "expires_at"),
+        health_score=health_score,
+        telemetry_measured_at=telemetry_measured_at,
     )
 
 
