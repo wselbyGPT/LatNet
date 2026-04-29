@@ -160,9 +160,10 @@ def test_hidden_service_end_to_end_echo_via_directory(monkeypatch, latnet_module
         intro_point = client.select_intro_point_for_phase1(fetched)
         assert intro_point["relay_name"] == intro_relay["name"]
 
-        service_intro = runtime.build_intro_circuits(descriptor, {intro_relay["name"]: intro_relay})[0]["circuit"]
-        client_intro = runtime.build_service_circuit([intro_relay], terminal_cmd="INTRO_READY")
-        client_rdv = runtime.build_service_circuit([rdv_relay], terminal_cmd="RENDEZVOUS_READY")
+        isolation_context = b"hs:client:default|service:test"
+        service_intro = runtime.build_intro_circuits(descriptor, {intro_relay["name"]: intro_relay}, isolation_context=isolation_context)[0]["circuit"]
+        client_intro = runtime.build_service_circuit([intro_relay], terminal_cmd="INTRO_READY", isolation_context=isolation_context)
+        client_rdv = runtime.build_service_circuit([rdv_relay], terminal_cmd="RENDEZVOUS_READY", isolation_context=isolation_context)
 
         cookie = "cookie-e2e"
         est_client = runtime._send_circuit_cmd(
@@ -178,7 +179,7 @@ def test_hidden_service_end_to_end_echo_via_directory(monkeypatch, latnet_module
         pending = runtime.poll_intro_requests(service_intro)
         assert len(pending) == 1
 
-        service_rdv, joined = runtime.establish_service_rendezvous(rdv_relay, cookie)
+        service_rdv, joined = runtime.establish_service_rendezvous(rdv_relay, cookie, isolation_context=isolation_context)
         assert joined is True
 
         runtime.rendezvous_send(client_rdv, cookie, "hello-e2e")
