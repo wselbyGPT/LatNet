@@ -84,3 +84,13 @@ Then rerun:
 ```bash
 ./deploy_wsl.sh
 ```
+
+## Browser UI entrypoint
+
+A standalone Qt browser package is available under `latnet_browser/` and is intentionally decoupled from relay/authority runtime internals for initial UI scaffolding.
+
+Run it with:
+
+```bash
+python -m latnet_browser
+```
