@@ -14,9 +14,11 @@ from latnet_browser.url_utils import normalize_user_url
 class BrowserWindow(QMainWindow):
     """Top-level window for the standalone browser application."""
 
+    _APP_TITLE = "LatNet Browser"
+
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("LatNet Browser")
+        self.setWindowTitle(self._APP_TITLE)
         self.resize(1024, 768)
 
         self._settings = BrowserSettings()
@@ -173,7 +175,7 @@ class BrowserWindow(QMainWindow):
         """Update the main window title from the active page title."""
         page_title = title.strip()
         if page_title:
-            self.setWindowTitle(f"{page_title} - LatNet Browser")
+            self.setWindowTitle(f"{page_title} - {self._APP_TITLE}")
             return
 
-        self.setWindowTitle("LatNet Browser")
+        self.setWindowTitle(self._APP_TITLE)
