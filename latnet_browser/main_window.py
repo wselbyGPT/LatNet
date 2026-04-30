@@ -52,6 +52,7 @@ class BrowserWindow(QMainWindow):
     def _bind_to_tab(self, tab: BrowserTab | None) -> None:
         """Connect window-level UI updates to the selected tab."""
         if self._active_tab is not None:
+            self._active_tab.titleChanged.disconnect(self._on_title_changed)
             self._active_tab.urlChanged.disconnect(self._sync_address_bar)
             self._active_tab.loadStarted.disconnect(self._on_load_started)
             self._active_tab.loadProgress.disconnect(self._on_load_progress)
@@ -59,12 +60,15 @@ class BrowserWindow(QMainWindow):
 
         self._active_tab = tab
         if tab is None:
+            self._on_title_changed("")
             return
 
+        tab.titleChanged.connect(self._on_title_changed)
         tab.urlChanged.connect(self._sync_address_bar)
         tab.loadStarted.connect(self._on_load_started)
         tab.loadProgress.connect(self._on_load_progress)
         tab.loadFinished.connect(self._on_load_finished)
+        self._on_title_changed(tab.view.title())
         self._sync_address_bar(tab.view.url())
 
     def _current_view(self):
@@ -164,3 +168,12 @@ class BrowserWindow(QMainWindow):
         """Update status UI when a page load finishes."""
         message = "Done" if success else "Failed to load page"
         self.statusBar().showMessage(message, 3000)
+
+    def _on_title_changed(self, title: str) -> None:
+        """Update the main window title from the active page title."""
+        page_title = title.strip()
+        if page_title:
+            self.setWindowTitle(f"{page_title} - LatNet Browser")
+            return
+
+        self.setWindowTitle("LatNet Browser")
