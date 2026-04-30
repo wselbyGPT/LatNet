@@ -36,6 +36,7 @@ class BrowserSettings:
     _KEY_SEARCH_TEMPLATE = "search_template"
     _KEY_BOOKMARKS = "bookmarks"
     _KEY_RECENT_DOWNLOADS = "recent_downloads"
+    _KEY_SITE_PERMISSIONS = "site_permissions"
 
     def __init__(self) -> None:
         self._settings = QSettings("LatNet", "LatNet Browser")
@@ -54,6 +55,9 @@ class BrowserSettings:
 
         if not self._settings.contains(self._KEY_RECENT_DOWNLOADS):
             self.set_recent_downloads([])
+
+        if not self._settings.contains(self._KEY_SITE_PERMISSIONS):
+            self.set_site_permissions({})
 
     def get_homepage_url(self) -> str:
         """Return the saved homepage URL."""
@@ -129,3 +133,60 @@ class BrowserSettings:
                 continue
             serializable.append({"filename": filename, "path": path, "state": state})
         self._settings.setValue(self._KEY_RECENT_DOWNLOADS, serializable)
+
+    def get_site_permissions(self) -> dict[str, dict[str, str]]:
+        """Return persisted per-origin permission decisions."""
+        raw_value = self._settings.value(self._KEY_SITE_PERMISSIONS, {})
+        if not isinstance(raw_value, dict):
+            return {}
+
+        parsed: dict[str, dict[str, str]] = {}
+        for origin, permissions in raw_value.items():
+            origin_key = str(origin).strip()
+            if not origin_key or not isinstance(permissions, dict):
+                continue
+            parsed_permissions: dict[str, str] = {}
+            for permission_type, decision in permissions.items():
+                permission_key = str(permission_type).strip()
+                decision_value = str(decision).strip().lower()
+                if not permission_key or decision_value not in {"allow", "deny"}:
+                    continue
+                parsed_permissions[permission_key] = decision_value
+            if parsed_permissions:
+                parsed[origin_key] = parsed_permissions
+        return parsed
+
+    def set_site_permissions(self, permissions: dict[str, dict[str, str]]) -> None:
+        """Persist per-origin permission decisions."""
+        serializable: dict[str, dict[str, str]] = {}
+        for origin, permission_map in permissions.items():
+            origin_key = str(origin).strip()
+            if not origin_key or not isinstance(permission_map, dict):
+                continue
+            normalized_map: dict[str, str] = {}
+            for permission_type, decision in permission_map.items():
+                permission_key = str(permission_type).strip()
+                decision_value = str(decision).strip().lower()
+                if not permission_key or decision_value not in {"allow", "deny"}:
+                    continue
+                normalized_map[permission_key] = decision_value
+            if normalized_map:
+                serializable[origin_key] = normalized_map
+        self._settings.setValue(self._KEY_SITE_PERMISSIONS, serializable)
+
+    def get_permission_decision(self, origin: str, permission_type: str) -> str | None:
+        """Return saved decision for an origin + permission type pair."""
+        permissions = self.get_site_permissions()
+        return permissions.get(origin, {}).get(permission_type)
+
+    def set_permission_decision(self, origin: str, permission_type: str, decision: str) -> None:
+        """Store a single decision for an origin + permission type pair."""
+        origin_key = origin.strip()
+        permission_key = permission_type.strip()
+        decision_value = decision.strip().lower()
+        if not origin_key or not permission_key or decision_value not in {"allow", "deny"}:
+            return
+
+        permissions = self.get_site_permissions()
+        permissions.setdefault(origin_key, {})[permission_key] = decision_value
+        self.set_site_permissions(permissions)
