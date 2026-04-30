@@ -21,12 +21,21 @@ _DEFAULT_BOOKMARKS: list[Bookmark] = [
 ]
 
 
+class DownloadRecord(TypedDict):
+    """Serializable recent download structure."""
+
+    filename: str
+    path: str
+    state: str
+
+
 class BrowserSettings:
     """Wrapper around ``QSettings`` keys used by the browser UI."""
 
     _KEY_HOMEPAGE_URL = "homepage_url"
     _KEY_SEARCH_TEMPLATE = "search_template"
     _KEY_BOOKMARKS = "bookmarks"
+    _KEY_RECENT_DOWNLOADS = "recent_downloads"
 
     def __init__(self) -> None:
         self._settings = QSettings("LatNet", "LatNet Browser")
@@ -42,6 +51,9 @@ class BrowserSettings:
 
         if not self._settings.contains(self._KEY_BOOKMARKS):
             self.set_bookmarks(_DEFAULT_BOOKMARKS)
+
+        if not self._settings.contains(self._KEY_RECENT_DOWNLOADS):
+            self.set_recent_downloads([])
 
     def get_homepage_url(self) -> str:
         """Return the saved homepage URL."""
@@ -86,3 +98,34 @@ class BrowserSettings:
                 continue
             serializable.append({"title": title, "url": url})
         self._settings.setValue(self._KEY_BOOKMARKS, serializable)
+
+
+    def get_recent_downloads(self) -> list[DownloadRecord]:
+        """Return persisted recent downloads list."""
+        raw_value = self._settings.value(self._KEY_RECENT_DOWNLOADS, [])
+        if not isinstance(raw_value, list):
+            return []
+
+        records: list[DownloadRecord] = []
+        for entry in raw_value:
+            if not isinstance(entry, dict):
+                continue
+            filename = str(entry.get("filename", "")).strip()
+            path = str(entry.get("path", "")).strip()
+            state = str(entry.get("state", "")).strip()
+            if not filename or not path or not state:
+                continue
+            records.append({"filename": filename, "path": path, "state": state})
+        return records
+
+    def set_recent_downloads(self, downloads: list[DownloadRecord]) -> None:
+        """Store recent download records in settings."""
+        serializable: list[DownloadRecord] = []
+        for entry in downloads:
+            filename = str(entry.get("filename", "")).strip()
+            path = str(entry.get("path", "")).strip()
+            state = str(entry.get("state", "")).strip()
+            if not filename or not path or not state:
+                continue
+            serializable.append({"filename": filename, "path": path, "state": state})
+        self._settings.setValue(self._KEY_RECENT_DOWNLOADS, serializable)

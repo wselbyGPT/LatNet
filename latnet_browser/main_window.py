@@ -3,6 +3,7 @@
 from urllib.parse import quote_plus
 
 from PyQt6.QtCore import QUrl
+from PyQt6.QtWebEngineCore import QWebEngineProfile
 from PyQt6.QtWidgets import (
     QInputDialog,
     QLineEdit,
@@ -15,6 +16,7 @@ from PyQt6.QtWidgets import (
 
 from latnet_browser.tabs import BrowserTab, BrowserTabWidget
 
+from latnet_browser.downloads import DownloadManager
 from latnet_browser.settings import BrowserSettings
 from latnet_browser.url_utils import normalize_user_url
 
@@ -30,6 +32,14 @@ class BrowserWindow(QMainWindow):
         self.resize(1024, 768)
 
         self._settings = BrowserSettings()
+
+        self._download_manager = DownloadManager(
+            QWebEngineProfile.defaultProfile(),
+            self._settings.get_recent_downloads(),
+            self,
+        )
+        self._download_manager.bind_profile_signals()
+        self._download_manager.downloadUpdated.connect(self._persist_recent_downloads)
 
         self._tab_widget = BrowserTabWidget(self)
         self.setCentralWidget(self._tab_widget)
@@ -47,12 +57,16 @@ class BrowserWindow(QMainWindow):
         self._toolbar.addAction("Home", self._navigate_home)
         self._toolbar.addWidget(self._address_bar)
         self._toolbar.addAction("Bookmark This Page", self._bookmark_current_page)
+        self._toolbar.addAction("Downloads", self._show_downloads)
         self._toolbar.addAction("Manage Bookmarks", self._manage_bookmarks)
 
         self._bookmarks_toolbar = QToolBar("Bookmarks", self)
         self.addToolBar(self._bookmarks_toolbar)
         self._bookmarks_toolbar.setMovable(False)
         self._bookmarks_toolbar.setFloatable(False)
+
+        self._tools_menu = self.menuBar().addMenu("Tools")
+        self._tools_menu.addAction("Downloads", self._show_downloads)
 
         self._settings_menu = self.menuBar().addMenu("Settings")
         self._settings_menu.addAction("Set Homepage...", self._prompt_for_homepage)
@@ -278,3 +292,12 @@ class BrowserWindow(QMainWindow):
             return
 
         self.setWindowTitle(self._APP_TITLE)
+
+
+    def _show_downloads(self) -> None:
+        """Open the downloads manager dialog."""
+        self._download_manager.show_dialog(self)
+
+    def _persist_recent_downloads(self) -> None:
+        """Persist latest download history records in settings."""
+        self._settings.set_recent_downloads(self._download_manager.recent_downloads)
