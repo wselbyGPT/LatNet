@@ -3,7 +3,15 @@
 from urllib.parse import quote_plus
 
 from PyQt6.QtCore import QUrl
-from PyQt6.QtWidgets import QInputDialog, QLineEdit, QMainWindow, QProgressBar, QStatusBar, QToolBar
+from PyQt6.QtWidgets import (
+    QInputDialog,
+    QLineEdit,
+    QMainWindow,
+    QMenu,
+    QProgressBar,
+    QStatusBar,
+    QToolBar,
+)
 
 from latnet_browser.tabs import BrowserTab, BrowserTabWidget
 
@@ -38,6 +46,13 @@ class BrowserWindow(QMainWindow):
         self._toolbar.addAction("Reload", self._reload)
         self._toolbar.addAction("Home", self._navigate_home)
         self._toolbar.addWidget(self._address_bar)
+        self._toolbar.addAction("Bookmark This Page", self._bookmark_current_page)
+        self._toolbar.addAction("Manage Bookmarks", self._manage_bookmarks)
+
+        self._bookmarks_toolbar = QToolBar("Bookmarks", self)
+        self.addToolBar(self._bookmarks_toolbar)
+        self._bookmarks_toolbar.setMovable(False)
+        self._bookmarks_toolbar.setFloatable(False)
 
         self._settings_menu = self.menuBar().addMenu("Settings")
         self._settings_menu.addAction("Set Homepage...", self._prompt_for_homepage)
@@ -54,6 +69,7 @@ class BrowserWindow(QMainWindow):
         self._active_tab: BrowserTab | None = None
         self._tab_widget.currentTabChanged.connect(self._bind_to_tab)
         self._bind_to_tab(self._tab_widget.current_browser_tab())
+        self._refresh_bookmarks_toolbar()
 
         self._navigate_home()
 
@@ -160,6 +176,75 @@ class BrowserWindow(QMainWindow):
 
         self._settings.set_search_template(candidate)
         self.statusBar().showMessage("Search engine updated", 3000)
+
+    def _bookmark_current_page(self) -> None:
+        """Save the current page as a bookmark."""
+        current_url = self._current_view().url().toString().strip()
+        validated_url = normalize_user_url(current_url)
+        if validated_url is None:
+            self.statusBar().showMessage("Cannot bookmark invalid URL", 3000)
+            return
+
+        title = self._current_view().title().strip() or validated_url.toString()
+        bookmarks = self._settings.get_bookmarks()
+        normalized_url = validated_url.toString()
+        for bookmark in bookmarks:
+            if bookmark["url"] == normalized_url:
+                bookmark["title"] = title
+                self._settings.set_bookmarks(bookmarks)
+                self._refresh_bookmarks_toolbar()
+                self.statusBar().showMessage("Bookmark updated", 3000)
+                return
+
+        bookmarks.append({"title": title, "url": normalized_url})
+        self._settings.set_bookmarks(bookmarks)
+        self._refresh_bookmarks_toolbar()
+        self.statusBar().showMessage("Page bookmarked", 3000)
+
+    def _manage_bookmarks(self) -> None:
+        """Show a simple menu to remove an existing bookmark."""
+        bookmarks = self._settings.get_bookmarks()
+        if not bookmarks:
+            self.statusBar().showMessage("No bookmarks to manage", 3000)
+            return
+
+        menu = QMenu(self)
+        for bookmark in bookmarks:
+            action_label = f"Remove: {bookmark['title']} ({bookmark['url']})"
+            action = menu.addAction(action_label)
+            action.triggered.connect(
+                lambda _checked=False, url=bookmark["url"]: self._remove_bookmark_by_url(url)
+            )
+
+        menu.exec(self.mapToGlobal(self._toolbar.geometry().bottomLeft()))
+
+    def _remove_bookmark_by_url(self, bookmark_url: str) -> None:
+        """Remove a bookmark by URL and refresh visible UI state."""
+        bookmarks = self._settings.get_bookmarks()
+        updated_bookmarks = [entry for entry in bookmarks if entry["url"] != bookmark_url]
+        if len(updated_bookmarks) == len(bookmarks):
+            return
+        self._settings.set_bookmarks(updated_bookmarks)
+        self._refresh_bookmarks_toolbar()
+        self.statusBar().showMessage("Bookmark removed", 3000)
+
+    def _refresh_bookmarks_toolbar(self) -> None:
+        """Re-render bookmark actions from persisted settings."""
+        self._bookmarks_toolbar.clear()
+        for bookmark in self._settings.get_bookmarks():
+            action = self._bookmarks_toolbar.addAction(bookmark["title"])
+            action.setToolTip(bookmark["url"])
+            action.triggered.connect(
+                lambda _checked=False, url=bookmark["url"]: self._open_bookmark(url)
+            )
+
+    def _open_bookmark(self, bookmark_url: str) -> None:
+        """Open bookmark URL in the current tab."""
+        url = normalize_user_url(bookmark_url)
+        if url is None:
+            self.statusBar().showMessage("Invalid bookmark URL", 3000)
+            return
+        self._current_view().setUrl(url)
 
     def _sync_address_bar(self, url: QUrl) -> None:
         """Update the address bar when browser URL changes."""
