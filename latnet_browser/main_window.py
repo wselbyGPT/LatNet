@@ -1,10 +1,13 @@
 """Main window implementation for the LatNet browser application."""
 
-from PyQt6.QtCore import QUrl
+from urllib.parse import quote_plus
 
-from latnet_browser.url_utils import normalize_user_url
+from PyQt6.QtCore import QUrl
 from PyQt6.QtWebEngineWidgets import QWebEngineView
-from PyQt6.QtWidgets import QLineEdit, QMainWindow, QStatusBar, QToolBar
+from PyQt6.QtWidgets import QInputDialog, QLineEdit, QMainWindow, QStatusBar, QToolBar
+
+from latnet_browser.settings import BrowserSettings
+from latnet_browser.url_utils import normalize_user_url
 
 
 class BrowserWindow(QMainWindow):
@@ -14,6 +17,8 @@ class BrowserWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("LatNet Browser")
         self.resize(1024, 768)
+
+        self._settings = BrowserSettings()
 
         self._web_view = QWebEngineView(self)
         self.setCentralWidget(self._web_view)
@@ -31,6 +36,10 @@ class BrowserWindow(QMainWindow):
         self._toolbar.addAction("Home", self._navigate_home)
         self._toolbar.addWidget(self._address_bar)
 
+        self._settings_menu = self.menuBar().addMenu("Settings")
+        self._settings_menu.addAction("Set Homepage...", self._prompt_for_homepage)
+        self._settings_menu.addAction("Set Search Engine...", self._prompt_for_search_template)
+
         self.setStatusBar(QStatusBar(self))
         self._web_view.urlChanged.connect(self._sync_address_bar)
         self._web_view.loadStarted.connect(self._on_load_started)
@@ -41,16 +50,69 @@ class BrowserWindow(QMainWindow):
 
     def _navigate_to_address_bar_url(self) -> None:
         """Navigate to the URL currently entered in the address bar."""
-        url = normalize_user_url(self._address_bar.text())
+        raw_input = self._address_bar.text().strip()
+        url = normalize_user_url(raw_input)
         if url is None:
-            self.statusBar().showMessage("Invalid URL", 3000)
+            search_url = self._build_search_url(raw_input)
+            self._web_view.setUrl(search_url)
             return
 
         self._web_view.setUrl(url)
 
     def _navigate_home(self) -> None:
         """Navigate to the default home URL."""
-        self._web_view.setUrl(QUrl("https://example.com"))
+        self._web_view.setUrl(normalize_user_url(self._settings.get_homepage_url()) or QUrl("https://example.com"))
+
+
+    def _build_search_url(self, query: str) -> QUrl:
+        """Build a search URL for non-URL address bar input."""
+        template = self._settings.get_search_template()
+        search_value = quote_plus(query)
+        search_candidate = template.replace("{query}", search_value)
+        return normalize_user_url(search_candidate) or QUrl("https://duckduckgo.com/?q=" + search_value)
+
+    def _prompt_for_homepage(self) -> None:
+        """Open a prompt allowing the user to set a homepage URL."""
+        value, accepted = QInputDialog.getText(
+            self,
+            "Set Homepage",
+            "Homepage URL:",
+            text=self._settings.get_homepage_url(),
+        )
+        if not accepted:
+            return
+
+        url = normalize_user_url(value)
+        if url is None:
+            self.statusBar().showMessage("Invalid homepage URL", 3000)
+            return
+
+        self._settings.set_homepage_url(url.toString())
+        self.statusBar().showMessage("Homepage updated", 3000)
+
+    def _prompt_for_search_template(self) -> None:
+        """Open a prompt allowing the user to set a search URL template."""
+        value, accepted = QInputDialog.getText(
+            self,
+            "Set Search Engine",
+            "Search template (use {query}):",
+            text=self._settings.get_search_template(),
+        )
+        if not accepted:
+            return
+
+        candidate = value.strip()
+        if not candidate or "{query}" not in candidate:
+            self.statusBar().showMessage("Search template must include {query}", 3000)
+            return
+
+        validation_url = normalize_user_url(candidate.replace("{query}", "test"))
+        if validation_url is None:
+            self.statusBar().showMessage("Invalid search template URL", 3000)
+            return
+
+        self._settings.set_search_template(candidate)
+        self.statusBar().showMessage("Search engine updated", 3000)
 
     def _sync_address_bar(self, url: QUrl) -> None:
         """Update the address bar when browser URL changes."""
