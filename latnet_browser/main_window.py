@@ -1,6 +1,8 @@
 """Main window implementation for the LatNet browser application."""
 
 from PyQt6.QtCore import QUrl
+
+from latnet_browser.url_utils import normalize_user_url
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWidgets import QLineEdit, QMainWindow, QStatusBar, QToolBar
 
@@ -37,18 +39,14 @@ class BrowserWindow(QMainWindow):
 
         self._navigate_home()
 
-    def _normalize_url(self, raw_url: str) -> QUrl:
-        """Return a normalized URL from user input."""
-        candidate = raw_url.strip()
-        if not candidate:
-            return QUrl("https://example.com")
-        if "://" not in candidate:
-            candidate = f"https://{candidate}"
-        return QUrl(candidate)
-
     def _navigate_to_address_bar_url(self) -> None:
         """Navigate to the URL currently entered in the address bar."""
-        self._web_view.setUrl(self._normalize_url(self._address_bar.text()))
+        url = normalize_user_url(self._address_bar.text())
+        if url is None:
+            self.statusBar().showMessage("Invalid URL", 3000)
+            return
+
+        self._web_view.setUrl(url)
 
     def _navigate_home(self) -> None:
         """Navigate to the default home URL."""
