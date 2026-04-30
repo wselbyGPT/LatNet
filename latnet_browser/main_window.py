@@ -3,8 +3,9 @@
 from urllib.parse import quote_plus
 
 from PyQt6.QtCore import QUrl
-from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWidgets import QInputDialog, QLineEdit, QMainWindow, QStatusBar, QToolBar
+
+from latnet_browser.tabs import BrowserTab, BrowserTabWidget
 
 from latnet_browser.settings import BrowserSettings
 from latnet_browser.url_utils import normalize_user_url
@@ -20,8 +21,8 @@ class BrowserWindow(QMainWindow):
 
         self._settings = BrowserSettings()
 
-        self._web_view = QWebEngineView(self)
-        self.setCentralWidget(self._web_view)
+        self._tab_widget = BrowserTabWidget(self)
+        self.setCentralWidget(self._tab_widget)
 
         self._address_bar = QLineEdit(self)
         self._address_bar.setPlaceholderText("Enter URL")
@@ -30,9 +31,9 @@ class BrowserWindow(QMainWindow):
         self._toolbar = QToolBar("Navigation", self)
         self.addToolBar(self._toolbar)
 
-        self._toolbar.addAction("Back", self._web_view.back)
-        self._toolbar.addAction("Forward", self._web_view.forward)
-        self._toolbar.addAction("Reload", self._web_view.reload)
+        self._toolbar.addAction("Back", self._navigate_back)
+        self._toolbar.addAction("Forward", self._navigate_forward)
+        self._toolbar.addAction("Reload", self._reload)
         self._toolbar.addAction("Home", self._navigate_home)
         self._toolbar.addWidget(self._address_bar)
 
@@ -41,12 +42,45 @@ class BrowserWindow(QMainWindow):
         self._settings_menu.addAction("Set Search Engine...", self._prompt_for_search_template)
 
         self.setStatusBar(QStatusBar(self))
-        self._web_view.urlChanged.connect(self._sync_address_bar)
-        self._web_view.loadStarted.connect(self._on_load_started)
-        self._web_view.loadProgress.connect(self._on_load_progress)
-        self._web_view.loadFinished.connect(self._on_load_finished)
+        self._active_tab: BrowserTab | None = None
+        self._tab_widget.currentTabChanged.connect(self._bind_to_tab)
+        self._bind_to_tab(self._tab_widget.current_browser_tab())
 
         self._navigate_home()
+
+
+    def _bind_to_tab(self, tab: BrowserTab | None) -> None:
+        """Connect window-level UI updates to the selected tab."""
+        if self._active_tab is not None:
+            self._active_tab.urlChanged.disconnect(self._sync_address_bar)
+            self._active_tab.loadStarted.disconnect(self._on_load_started)
+            self._active_tab.loadProgress.disconnect(self._on_load_progress)
+            self._active_tab.loadFinished.disconnect(self._on_load_finished)
+
+        self._active_tab = tab
+        if tab is None:
+            return
+
+        tab.urlChanged.connect(self._sync_address_bar)
+        tab.loadStarted.connect(self._on_load_started)
+        tab.loadProgress.connect(self._on_load_progress)
+        tab.loadFinished.connect(self._on_load_finished)
+        self._sync_address_bar(tab.view.url())
+
+    def _current_view(self):
+        tab = self._tab_widget.current_browser_tab()
+        if tab is None:
+            tab = self._tab_widget.add_browser_tab(make_current=True)
+        return tab.view
+
+    def _navigate_back(self) -> None:
+        self._current_view().back()
+
+    def _navigate_forward(self) -> None:
+        self._current_view().forward()
+
+    def _reload(self) -> None:
+        self._current_view().reload()
 
     def _navigate_to_address_bar_url(self) -> None:
         """Navigate to the URL currently entered in the address bar."""
@@ -54,14 +88,14 @@ class BrowserWindow(QMainWindow):
         url = normalize_user_url(raw_input)
         if url is None:
             search_url = self._build_search_url(raw_input)
-            self._web_view.setUrl(search_url)
+            self._current_view().setUrl(search_url)
             return
 
-        self._web_view.setUrl(url)
+        self._current_view().setUrl(url)
 
     def _navigate_home(self) -> None:
         """Navigate to the default home URL."""
-        self._web_view.setUrl(normalize_user_url(self._settings.get_homepage_url()) or QUrl("https://example.com"))
+        self._current_view().setUrl(normalize_user_url(self._settings.get_homepage_url()) or QUrl("https://example.com"))
 
 
     def _build_search_url(self, query: str) -> QUrl:
