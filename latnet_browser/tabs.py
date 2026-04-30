@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from PyQt6.QtCore import QObject, pyqtSignal
+from PyQt6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWidgets import QTabWidget, QWidget
 
@@ -16,9 +17,10 @@ class BrowserTab(QObject):
     loadFinished = pyqtSignal(bool)
     titleChanged = pyqtSignal(str)
 
-    def __init__(self, parent: QObject | None = None) -> None:
+    def __init__(self, profile: QWebEngineProfile, parent: QObject | None = None) -> None:
         super().__init__(parent)
         self.view = QWebEngineView()
+        self.view.setPage(QWebEnginePage(profile, self.view))
         self.view.urlChanged.connect(self.urlChanged.emit)
         self.view.loadStarted.connect(self.loadStarted.emit)
         self.view.loadProgress.connect(self.loadProgress.emit)
@@ -31,8 +33,9 @@ class BrowserTabWidget(QTabWidget):
 
     currentTabChanged = pyqtSignal(object)
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(self, profile: QWebEngineProfile, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self._profile = profile
         self.setDocumentMode(True)
         self.setTabsClosable(True)
         self.tabCloseRequested.connect(self.close_tab)
@@ -59,7 +62,7 @@ class BrowserTabWidget(QTabWidget):
         return self.browser_tab_at(self.currentIndex())
 
     def add_browser_tab(self, make_current: bool = False) -> BrowserTab:
-        tab = BrowserTab(self)
+        tab = BrowserTab(self._profile, self)
         title = "New Tab"
         tab_index = self.insertTab(self._new_tab_index, tab.view, title)
         tab.view.setProperty("browser_tab", tab)
