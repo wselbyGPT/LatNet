@@ -3,7 +3,7 @@
 from urllib.parse import quote_plus
 
 from PyQt6.QtCore import QUrl
-from PyQt6.QtWidgets import QInputDialog, QLineEdit, QMainWindow, QStatusBar, QToolBar
+from PyQt6.QtWidgets import QInputDialog, QLineEdit, QMainWindow, QProgressBar, QStatusBar, QToolBar
 
 from latnet_browser.tabs import BrowserTab, BrowserTabWidget
 
@@ -44,6 +44,13 @@ class BrowserWindow(QMainWindow):
         self._settings_menu.addAction("Set Search Engine...", self._prompt_for_search_template)
 
         self.setStatusBar(QStatusBar(self))
+        self._load_progress = QProgressBar(self)
+        self._load_progress.setRange(0, 100)
+        self._load_progress.setValue(0)
+        self._load_progress.setTextVisible(False)
+        self._load_progress.setFixedWidth(140)
+        self._load_progress.hide()
+        self.statusBar().addPermanentWidget(self._load_progress)
         self._active_tab: BrowserTab | None = None
         self._tab_widget.currentTabChanged.connect(self._bind_to_tab)
         self._bind_to_tab(self._tab_widget.current_browser_tab())
@@ -160,14 +167,21 @@ class BrowserWindow(QMainWindow):
 
     def _on_load_started(self) -> None:
         """Update status UI when a page load starts."""
+        self._load_progress.setRange(0, 0)
+        self._load_progress.show()
         self.statusBar().showMessage("Loading...")
 
     def _on_load_progress(self, progress: int) -> None:
         """Update status UI with load progress percentage."""
+        self._load_progress.setRange(0, 100)
+        self._load_progress.setValue(progress)
         self.statusBar().showMessage(f"Loading... {progress}%")
 
     def _on_load_finished(self, success: bool) -> None:
         """Update status UI when a page load finishes."""
+        self._load_progress.hide()
+        self._load_progress.setRange(0, 100)
+        self._load_progress.setValue(0)
         message = "Done" if success else "Failed to load page"
         self.statusBar().showMessage(message, 3000)
 
